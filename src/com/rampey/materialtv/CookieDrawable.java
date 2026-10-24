@@ -20,11 +20,25 @@ final class CookieDrawable extends Drawable {
     private float fromDepth, toDepth;
     private float fromSharp = 1f, toSharp = 1f;
     private float t = 1f;
+    private final float[] fromX = new float[STEPS + 1], fromY = new float[STEPS + 1];
+    private final float[] toX = new float[STEPS + 1], toY = new float[STEPS + 1];
+
+    private static void outline(float[] x, float[] y, int lobes, float depth, float sharp) {
+        for (int i = 0; i <= STEPS; i++) {
+            double a = 2 * Math.PI * i / STEPS;
+            float radius = 1f + depth * wave(a, lobes, sharp);
+            x[i] = radius * (float) Math.cos(a);
+            y[i] = radius * (float) Math.sin(a);
+        }
+    }
 
     CookieDrawable(int color, int lobes, float depth) {
         paint.setColor(color);
         fromLobes = toLobes = lobes;
         fromDepth = toDepth = depth;
+        outline(fromX, fromY, lobes, depth, 1f);
+        System.arraycopy(fromX, 0, toX, 0, fromX.length);
+        System.arraycopy(fromY, 0, toY, 0, fromY.length);
     }
 
     void setColor(int color) {
@@ -46,6 +60,9 @@ final class CookieDrawable extends Drawable {
         toLobes = lobes;
         toDepth = depth;
         toSharp = sharpness;
+        // Trigonometry belongs to target changes, not every animation frame.
+        outline(fromX, fromY, fromLobes, fromDepth, fromSharp);
+        outline(toX, toY, toLobes, toDepth, toSharp);
         t = 0f;
     }
 
@@ -71,12 +88,8 @@ final class CookieDrawable extends Drawable {
         float maxDepth = Math.max(fromDepth, toDepth);
         float r = Math.min(b.width(), b.height()) / 2f / (1f + maxDepth);
         for (int i = 0; i <= STEPS; i++) {
-            double a = 2 * Math.PI * i / STEPS;
-            float r1 = r * (1f + fromDepth * wave(a, fromLobes, fromSharp));
-            float r2 = r * (1f + toDepth * wave(a, toLobes, toSharp));
-            float rr = r1 + (r2 - r1) * t;
-            float x = cx + rr * (float) Math.cos(a);
-            float y = cy + rr * (float) Math.sin(a);
+            float x = cx + r * (fromX[i] + (toX[i] - fromX[i]) * t);
+            float y = cy + r * (fromY[i] + (toY[i] - fromY[i]) * t);
             if (i == 0) path.moveTo(x, y); else path.lineTo(x, y);
         }
         path.close();

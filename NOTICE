@@ -1,0 +1,19 @@
+CleanFire Launcher — Fire OS port
+
+Based on Material TV Launcher by 0xRampey and contributors:
+https://github.com/0xRampey/material-tv-launcher
+Upstream baseline: eccdc92 (v0.1.4).
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This fork modifies application identity, Android 11 build compatibility,
+app discovery, lifecycle handling and installation behavior for Fire OS.
+The original Java interface, Material styling and animations are retained.
+
+Includes material-color-utilities by Google and contributors (Apache 2.0).
+See third_party/material-color-utilities/LICENSE and README.md for provenance.
+Includes Google Sans Flex (SIL Open Font License 1.1).
+See assets/fonts/GoogleSansFlex-OFL.txt and GoogleSansFlex-TRADEMARKS.md.
+
+Google, Google Sans and Material Design belong to Google. Amazon and Fire TV
+belong to their respective owners. This fork is not affiliated with or
+endorsed by Google, Amazon or the upstream project.

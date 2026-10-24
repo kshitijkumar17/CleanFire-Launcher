@@ -1,18 +1,23 @@
 # AGENTS.md
 
-Guidance for coding agents (and people) working on Material TV Launcher. Read this before changing the UI.
+Guidance for coding agents (and people) working on CleanFire Launcher, the Fire OS fork of Material TV Launcher. Read this before changing the UI.
 Installation, build and troubleshooting details also live here; keep the README focused on the launcher.
 
 ## What this is
 
 A buttery smooth launcher for Android TV / Google TV: the user's most-used apps, colors that follow the focused app,
-Material 3 Expressive design. It is **only a launcher**: no debloat tooling, no AI, no network.
+Material 3 Expressive design. It is **only a launcher**: no debloat tooling or AI. The Fire OS fork
+uses HTTPS for its weather widget; the upstream notes below still describe the original Now Playing feature.
 
 ## Hard rules
 
-- **No `INTERNET` permission.** Nothing the app reads may leave the TV.
-- **Nothing user-specific in code.** The dock comes from on-device usage stats and installed apps; HDMI devices come
-  from HDMI-CEC names. No hardcoded app lists, TV models, IPs or names.
+- **Weather is the only network use in this Fire OS fork.** `INTERNET` is used for keyless HTTPS
+  public-IP geolocation (`ipdata.free`) and Open-Meteo forecasts. Weather never uses Android location permission.
+  The Settings panel may request optional foreground location access solely to show the connected Wi-Fi name,
+  which Android 11 otherwise redacts. Never use that permission for weather or tracking.
+- **No user-specific app lists or device identifiers in code.** The dock comes from on-device usage stats and
+  installed apps; HDMI devices come from HDMI-CEC names. Weather city and coordinates come from the device's
+  public-IP geolocation response and are cached only in app-private preferences.
 - **No brand logos we don't own.** Console tiles use Material icons on a tone of the brand hue, never a logo.
 - **Nothing animates while another app is on screen.** Stop every loop in `onPause`; resume in `onResume`.
 - **Smooth on weak TVs** (4 × Cortex-A73 at 1.39 GHz, 2.4 GB RAM): animations run on display frames
@@ -68,136 +73,43 @@ fill the width; Now Playing card 380 dp on the right.
 
 Small, one topic each, plain messages. **No `Co-Authored-By` or other AI attribution trailers.**
 
-## Install with a coding agent
+## Build and install this Fire OS fork
 
-**Install it with your coding agent.** Turn on USB debugging on the TV ([how](#quick-start)), then paste this
-into Claude Code, Codex or any agent that can run commands:
+Use JDK 17+, Android SDK platform 30 and Build Tools 35.0.0. `./build.sh` or
+`./build.sh --debug` produces `build/material-home-fireos.apk` with the local debug key.
+`./build.sh --release` requires a persistent signing identity through
+`RELEASE_KEYSTORE`, `RELEASE_KEYSTORE_PASS`, and `RELEASE_KEY_ALIAS` (optional
+`RELEASE_KEY_PASS`) and produces `build/cleanfire-release.apk`. Keep signing
+material outside the repository. See [README.md](README.md#build-from-source).
 
-```text
-Install Material TV Launcher (https://github.com/0xRampey/material-tv-launcher) on my Android TV
-by following its Quick start. My TV's IP address is 192.168.1.50.
-```
+Connect ADB to the Fire TV and install only this fork with
+`./install-fireos.sh <adb-serial>`. That script updates and opens CleanFire
+Launcher; it does not alter Home-button routing, permissions, or stock packages.
+`./uninstall-fireos.sh <adb-serial>` removes only this fork and may erase its
+preferences. Home on Fire is optional and must be configured separately by
+its owner. Never run the original upstream installation scripts for this fork.
 
-Use your TV's own IP address (Settings → Network & Internet). Rather do it yourself? See [Quick start](#quick-start).
+## Privacy and verification
 
-## Quick start
+Weather requests use HTTPS to `ipdata.free` for approximate public-IP location
+and `api.open-meteo.com` for forecasts. The optional foreground location
+permission in Settings is used only for the Wi-Fi SSID. No API key is needed or
+bundled. `aapt2 dump permissions build/material-home-fireos.apk` lists the
+packaged permissions. The app does not request root or privileged permissions.
 
-You need a computer on the same Wi-Fi as the TV, with
-[ADB](https://developer.android.com/tools/releases/platform-tools) installed (`adb version` works in a terminal).
+Before shipping, run `./build.sh --debug`,
+`$ANDROID_HOME/build-tools/35.0.0/apksigner verify --verbose build/material-home-fireos.apk`,
+`bash -n build.sh install-fireos.sh uninstall-fireos.sh`, and `git diff --check`.
+Test UI changes on the actual Fire TV and capture full-resolution screenshots.
+See [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) for release gates.
 
-**1. On the TV**
-Settings → System → About (on Android TV: Settings → Device Preferences → About) → press OK on **Android TV OS
-build** seven times → go back → Developer options → turn on **USB debugging** (and **Network debugging** if you
-see it). Note the TV's IP address under Settings → Network & Internet.
+## License and attribution
 
-**2. On your computer**
-Download the app and the scripts from the
-[latest release](https://github.com/0xRampey/material-tv-launcher/releases/latest) into one folder, then run
-`install.sh` with your TV's IP address:
-
-```bash
-curl -fLO https://github.com/0xRampey/material-tv-launcher/releases/latest/download/material-tv-launcher.apk
-curl -fLO https://github.com/0xRampey/material-tv-launcher/releases/latest/download/install.sh
-curl -fLO https://github.com/0xRampey/material-tv-launcher/releases/latest/download/uninstall.sh
-bash install.sh 192.168.1.50
-```
-
-**3. On the TV again**
-When the TV shows **Allow USB debugging?**, accept it; the script waits for you. It finishes with
-`Done: Material TV Launcher is on screen.` (if it says it isn't on screen yet, press Home). From then on, Home
-on the remote brings it up.
-
-Changed your mind? `bash uninstall.sh 192.168.1.50` brings the TV's own home screen back.
-
-## Screensaver setup
-
-<details>
-<summary><strong>Turn on the screensaver</strong></summary>
-
-```bash
-adb shell settings put secure screensaver_components com.rampey.materialtv/com.rampey.materialtv.Screensaver
-```
-
-Before switching, save the current one with `adb shell settings get secure screensaver_components`; to go back,
-`put` that value again.
-It starts after the TV's idle time (`adb shell settings get system screen_off_timeout`).
-</details>
-
-## Privacy
-
-The app has **no internet permission**, so nothing it reads can leave the TV. Check it yourself:
-`aapt2 dump permissions material-tv-launcher.apk` (`aapt2` comes with the Android SDK build-tools).
-
-| `install.sh` switches on | Why |
-|---|---|
-| Accessibility service (*Home button*) | To catch the remote's Home button. It reads no screen content ([code](src/com/rampey/materialtv/HomeKeyService.java)). |
-| Usage access | To order the dock by how much you use each app. |
-| Notification access (*Now Playing*) | To see which app is playing. It reads no notifications ([code](src/com/rampey/materialtv/MediaListener.java)). |
-
-## Build it yourself
-
-<details>
-<summary><strong>No Gradle, just the Android SDK</strong></summary>
-
-You need the Android SDK (platform 34, build-tools 34.0.0) and JDK 17.
-
-```bash
-./build.sh                    # → build/material-tv-launcher.apk, signed with your Android debug key
-./install.sh 192.168.1.50
-```
-
-Set `KEYSTORE`, `KEYSTORE_PASS` and `KEY_ALIAS` to sign with your own key, and `ANDROID_HOME` if your SDK lives
-elsewhere. The code is plain Java:
-
-| File | What it is |
-|---|---|
-| [`HomeActivity.java`](src/com/rampey/materialtv/HomeActivity.java) | The home screen: clock, buttons, dock, Apps grid, Now Playing |
-| [`Palette.java`](src/com/rampey/materialtv/Palette.java) | Colors from each app's banner |
-| [`Motion.java`](src/com/rampey/materialtv/Motion.java) | Material 3 Expressive spring curves |
-| [`ButtonGroup.java`](src/com/rampey/materialtv/ButtonGroup.java) | The top-bar strip |
-| [`CookieDrawable.java`](src/com/rampey/materialtv/CookieDrawable.java) | The morphing background shape |
-| [`Screensaver.java`](src/com/rampey/materialtv/Screensaver.java), [`ShapeScene.java`](src/com/rampey/materialtv/ShapeScene.java) | The time-of-day screensaver |
-| [`HomeKeyService.java`](src/com/rampey/materialtv/HomeKeyService.java) | The Home-button redirect |
-</details>
-
-## Troubleshooting
-
-- **Home still opens Google TV.** The accessibility service is off. Run `install.sh` again, or turn on **Home
-  button** under Settings → System → Accessibility.
-- **Google TV flashes for a second after the TV boots.** Expected: Android starts the service a moment after
-  boot, then this launcher takes over.
-- **`adb` says unauthorized.** Accept the **Allow USB debugging?** prompt on the TV and run the script again.
-- **No Now Playing card.** The app has to publish what it's playing. Some apps also stop playing as soon as you
-  leave them.
-- **No console tile.** Your console has to announce itself over HDMI-CEC. Turn on HDMI-CEC (your TV may call it
-  "HDMI Device Control" or a brand name ending in Sync or Link) on both the TV and the console.
-
-## Questions people ask
-
-**Is it safe? Can it break my TV?**
-No. It's one ordinary app. Nothing is rooted, flashed or deleted, and `uninstall.sh` undoes everything.
-
-**Why not [tv-vibehack](https://github.com/Gathin23/tv-vibehack)?**
-It's a full kit for cleaning up a TV, with its own Apple TV-style launcher. This is only a launcher: pretty light, made
-for weak TVs, in Material 3 Expressive. You can use this launcher on its own or alongside tv-vibehack.
-
-**How much memory does it use?**
-About 40 MB (PSS in `adb shell dumpsys meminfo com.rampey.materialtv`). On our test TV, Google TV's own home used
-about 150 MB measured the same way, across its two processes. Your numbers will differ.
-
-**Does it switch my PS5 on?**
-Only when you select its tile. Switching to the input wakes the console over HDMI-CEC, same as the TV's input
-menu.
-
-**Can I pin my own apps?**
-Not yet. The dock follows what you use. A pin option is a welcome contribution.
-
-## License
-
-Apache 2.0, see [`LICENSE`](LICENSE). Bundled:
-[material-color-utilities](https://github.com/material-foundation/material-color-utilities) (Apache 2.0) and
-[Google Sans Flex](https://github.com/googlefonts/googlesans-flex) (SIL Open Font License 1.1). "Google",
-"Google Sans" and "Material Design" belong to Google; this project is not affiliated with or endorsed by Google.
+Apache 2.0, see [LICENSE](LICENSE) and [NOTICE](NOTICE). Upstream:
+[Material TV Launcher](https://github.com/0xRampey/material-tv-launcher) by
+0xRampey and contributors. Bundled material-color-utilities is Apache 2.0;
+Google Sans Flex is under the SIL Open Font License 1.1. Weather provider
+attribution is in the README.
 
 ## Pull request reports
 

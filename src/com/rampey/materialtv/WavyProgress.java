@@ -52,7 +52,7 @@ final class WavyProgress extends View {
         this.duration = duration;
         this.playing = playing;
         lastFrame = 0;
-        postInvalidateOnAnimation();
+        if (animating && isAttachedToWindow() && isShown()) postInvalidateOnAnimation();
     }
 
     private float progress() {
@@ -60,6 +60,14 @@ final class WavyProgress extends View {
         long pos = position;
         if (playing && updatedAt > 0) pos += (long) ((SystemClock.elapsedRealtime() - updatedAt) * speed);
         return Math.max(0f, Math.min(1f, pos / (float) duration));
+    }
+
+    private boolean animating;
+
+    void setAnimating(boolean active) {
+        animating = active;
+        lastFrame = 0;
+        if (active && isAttachedToWindow()) invalidate();
     }
 
     @Override protected void onDraw(Canvas canvas) {
@@ -82,7 +90,7 @@ final class WavyProgress extends View {
         canvas.drawPath(wave, active);
         if (end + gap < w - inset) canvas.drawLine(end + gap, mid, w - inset, mid, track);
 
-        if ((playing || Math.abs(amp - target) > 0.05f) && isShown()) postInvalidateOnAnimation();
+        if ((playing || Math.abs(amp - target) > 0.05f) && animating && isAttachedToWindow() && getWindowVisibility() == VISIBLE && isShown()) postInvalidateOnAnimation();
     }
 
     static int dp(Context c, float v) {

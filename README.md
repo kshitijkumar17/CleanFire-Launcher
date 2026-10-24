@@ -1,77 +1,86 @@
-<div align="center">
+# CleanFire Launcher
 
-# Material TV Launcher
+A customizable, Material-inspired launcher for supported Fire TV devices. CleanFire Launcher is a Fire OS fork of [Material TV Launcher by 0xRampey](https://github.com/0xRampey/material-tv-launcher). It replaces recommendation-heavy Home content with a six-app dock, alphabetical app grid, and weather. It is independent of Amazon and the upstream developer.
 
-**A fluid launcher for Android TV and Google TV.**
+![CleanFire Launcher Home](docs/images/home.png)
 
-Your most-used apps, in the order you use them, in colors that follow the app you're on.
-No ads, no recommendations, no internet permission, about 40 MB of memory.
+Weather: [Open-Meteo](https://open-meteo.com/). Approximate IP location: [ipdata.co](https://ipdata.co/).
 
-[![Download APK](https://img.shields.io/badge/Download-APK-3DDC84?style=for-the-badge&logo=android&logoColor=white)](https://github.com/0xRampey/material-tv-launcher/releases/latest/download/material-tv-launcher.apk)
+## Features
 
-</div>
+- Native Java Views with app-based dynamic colors, animated Material shapes, focus rings, and D-pad navigation.
+- Six customizable Home shortcuts. Short Select launches an app; long Select opens Move/Replace. Move swaps adjacent slots with Left/Right, Select saves, and Back cancels. Replace opens an installed-app picker.
+- An alphabetical Apps tab with names below tiles. Its tune button shows all installed launchable apps; hidden apps appear greyed out. Select toggles a tile's visibility. Tune, Back, or leaving the tab saves the change. Hiding an app in Apps does not remove its Home shortcut.
+- A Settings side panel with Wi-Fi, Bluetooth, and All settings destinations. It shows connected network and audio-device names when Android makes them available.
+- Keyless weather with approximate city detection, current and feels-like Celsius temperature, today's low/high, current-hour rain probability, and an offline cache.
+- An optional Android screensaver component, never enabled automatically.
 
-![Material TV Launcher: Spotify in focus with the whole screen tinted Spotify green, an equalizer under its tile, Now Playing with a wavy progress line, and a dock of the six most-used apps](docs/home-playing.png)
+The earlier Preferences tab was removed. Home shortcut editing is now in the Home tile menu, and app visibility editing is behind the Apps tune button. Upstream Now Playing, HDMI switching, and Home-key service code are not active features of this Fire OS build.
 
-## What you get
+## Supported devices
 
-- **Your apps, by use.** The dock shows the six apps you use most, most used on the left. It reorders itself
-  as your habits change. No app list is hardcoded, so it works on anyone's TV.
-- **Colors from the app you're on.** As you move, the background, the shape, the buttons and the Now Playing
-  card re-tint to the focused app, using Google's own
-  [material-color-utilities](https://github.com/material-foundation/material-color-utilities) (the same math
-  behind Android's wallpaper colors).
-- **Your consoles, by name.** Instead of a generic "Live TV" tile, devices that announce themselves over HDMI
-  (a PlayStation 5, an Xbox) get their own tile, with a green dot while they're on. Select it and the TV switches
-  straight to that input.
-- **Now Playing.** When music or video plays in any app (Spotify, YouTube Music, ...), a card shows the art,
-  the song, a wavy progress line and a play/pause button, and a little equalizer marks the playing app in the dock.
-- **Material 3 Expressive.** Spring motion, a colored focus glow, shapes from the Material shape library that
-  morph as you move, a top-bar strip, neighbors that make room, a morphing loader when an app is slow,
-  and a Google Sans Flex clock whose weight follows the time of day.
-- **Fluid motion.** Animations stay in sync with your TV's refresh rate. Tested on a quad-core TV chip,
-  using about 40 MB of memory. Nothing animates or polls while you're in another app.
+**Tested:** Fire TV Stick 4K, 2nd generation (2023), model AFTKM, Fire OS 8.1.8.5 (Android 11 / API 30). Other Fire OS 8 and Android TV devices may work but are unverified. The stock Amazon launcher remains installed.
 
-**And a screensaver that follows the sun.** *Material TV Clock* draws a fresh Material You-style wallpaper
-every hour: indigo at night, peach at sunrise, sky blue at midday, orange at sunset.
+## Install
 
-![The screensaver: a large clock, the date and the song that is playing over soft Material shapes in early-evening greens](docs/screensaver.png)
+Download an APK from this project's GitHub Releases page once published. Wireless ADB requires the computer and TV on the same network. Enable ADB debugging on the TV where the firmware permits it, accept its authorization prompt, then run:
 
-## Set as default launcher
+```sh
+adb connect FIRE_TV_IP:5555
+adb install CleanFire-Launcher-v1.0.0.apk
+adb shell am start -n dev.karat.materialhome/com.rampey.materialtv.HomeActivity
+```
 
-Google TV ignores any home screen that isn't its own, so a launcher needs a little help:
+If connection is refused or there is no route to host, check the TV's address, network, and ADB setting. If installation succeeded but the launcher does not open, run the `am start` command again. `adb install -r` can update only an APK signed with the **same certificate**. A debug-signed development install cannot be updated in place by a differently signed public release. Uninstalling can erase preferences; back up your setup before changing signing identities. Neither the APK nor `install-fireos.sh` changes Home-button routing or system packages.
 
-1. **Install** one APK from your computer over Wi-Fi, using the TV's debug bridge (ADB).
-2. **Switch on** three things with one script: a tiny accessibility service that sends the remote's Home button
-   here, usage access to order your apps, and notification access so the Now Playing card can see which app is playing.
-3. **Press Home.** That's it. Nothing on the TV is removed, and one command puts everything back.
+Fire OS normally keeps Amazon Home as the Home-button destination. [Home on Fire](https://github.com/toolicious/home-on-fire) is an optional, separate workaround whose compatibility varies by firmware. Configure it yourself if desired and keep Amazon Home for recovery. CleanFire Launcher does not bundle it or enable an accessibility service.
 
-Follow the [Quick start](AGENTS.md#quick-start) yourself or [install with your coding agent](AGENTS.md#install-with-a-coding-agent).
+## Use the remote
 
-## Supported TVs
+Use the D-pad to focus a tab or tile and Select to open it. On Home, hold Select on an app tile for Move/Replace. In Move, Left/Right swaps a neighboring slot, Select saves, and Back restores the previous order. Replace lets you choose an installed app or press Back to cancel. On Apps, the tune icon beside “All apps” shows hidden and visible apps; Select toggles one. Back exits editing, saves, and stays on Apps. Back from the normal Apps view returns Home. Settings opens a side panel whose rows launch native Fire TV Settings.
 
-Any TV running Android TV or Google TV on **Android 12 or newer**, from any brand. Tested on Google TV. Untested:
-classic Android TV (the Home button should work the same way) and Amazon Fire TV (Fire OS, which is based on
-Android). Not supported: Samsung (Tizen) and LG (webOS).
+The Apps grid discovers launcher/Leanback activities from installed packages. An app missing from the grid may be hidden: open Apps → tune to restore it. Apps without a compatible launch activity cannot appear. Home shortcuts are independent of Apps visibility.
 
-Tried it on your TV? A short report with a screenshot helps others, see [Contributing](#contributing).
+## Weather and privacy
 
-## Privacy
+Weather uses [ipdata.free](https://ipdata.co/free) to infer city, country, coordinates, and timezone from the device's public IP. Coordinates and timezone go to [Open-Meteo](https://open-meteo.com/en/docs) for a forecast. No API key or Android location permission is used for weather. Approximate location is cached in app-private preferences for about 24 hours; forecasts refresh about every 15 minutes while Home is active. The last good response remains available offline, and provider failure leaves the launcher usable. VPNs, shared gateways, and ISP routing can make the city inaccurate.
 
-The app has **no internet permission**, so nothing it reads can leave the TV.
+The Settings panel may ask for optional foreground Android location permission solely to read the connected Wi-Fi name, which Fire OS otherwise redacts. Denial leaves an unavailable label. The app queries launchable packages and may use user-granted usage access for ordering; it does not transmit app lists, device identifiers, or analytics. The current fork's only network calls are the two weather requests above. [ipdata.free's keyless tier](https://ipdata.co/free) allows 1,000 requests per calling public IP daily, shared by devices behind it, and requires visible attribution. [Open-Meteo's free API terms](https://open-meteo.com/en/terms) allow non-commercial use with attribution and rate limits. Commercial distribution would require an appropriate Open-Meteo plan or another provider.
 
-See [permissions and verification](AGENTS.md#privacy).
+## Build from source
 
-## Contributing
+Use JDK 17+, Android SDK platform 30, and Build Tools 35.0.0 on macOS or Linux. Clone your public fork, set `ANDROID_HOME` if needed, then:
 
-The most useful thing you can send is a tested-TV report with a screenshot. Launcher ideas that keep it light
-are welcome too: see [CONTRIBUTING.md](CONTRIBUTING.md).
+```sh
+./build.sh --debug
+# build/material-home-fireos.apk, signed with the local Android debug key
+```
 
-[Build instructions](AGENTS.md#build-it-yourself) and [troubleshooting](AGENTS.md#troubleshooting) are in AGENTS.md.
+`./build.sh` without an option is the same debug build. Release builds require a persistent keystore and signing values; the script never creates a release identity implicitly:
 
-## License
+```sh
+export RELEASE_KEYSTORE=/secure/path/cleanfire-release.jks
+export RELEASE_KEY_ALIAS=cleanfire
+printf 'Release keystore password: '
+read -rs RELEASE_KEYSTORE_PASS
+printf '\n'
+export RELEASE_KEYSTORE_PASS
+./build.sh --release
+# build/cleanfire-release.apk
+```
 
-Apache 2.0, see [`LICENSE`](LICENSE). Bundled:
-[material-color-utilities](https://github.com/material-foundation/material-color-utilities) (Apache 2.0) and
-[Google Sans Flex](https://github.com/googlefonts/googlesans-flex) (SIL Open Font License 1.1). "Google",
-"Google Sans" and "Material Design" belong to Google; this project is not affiliated with or endorsed by Google.
+Set `RELEASE_KEY_PASS` if the private-key password differs. Keep the keystore and passwords outside the repository and back them up securely for all future updates. To create your own identity once, run `keytool -genkeypair -keystore /secure/path/cleanfire-release.jks -alias cleanfire -keyalg RSA -keysize 3072 -validity 10000` and let it prompt for passwords. Verify with `$ANDROID_HOME/build-tools/35.0.0/apksigner verify --verbose --print-certs build/cleanfire-release.apk`. Release mode drops Java debug information and uses D8 release mode; it does not minify or obfuscate classes.
+
+Version 1.0.0 uses versionCode 184. The ID remains `dev.karat.materialhome` for upgrades and preference continuity when the certificate matches. See [FIREOS_PORTING.md](FIREOS_PORTING.md), [DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md), and [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md).
+
+## Troubleshooting
+
+- **Weather unavailable or wrong city:** check network access, wait for a retry, and consider a VPN or ISP gateway. Cached readings may be stale offline.
+- **Home opens Amazon Home:** configure Home on Fire separately if it supports your firmware; direct ADB launch still works.
+- **App missing from Apps:** open Apps → tune and unhide it; otherwise check for a launchable activity.
+- **Signature mismatch or failed update:** the installed APK uses a different certificate. Review the data-loss warning above before removing anything.
+- **Old Fire TV library artwork:** Fire OS may cache an app's name/icon after an update. App Details shows Android's current metadata. A data-preserving `pm uninstall -k` / reinstall refreshed the test device's library, but can affect integrations and should not be done casually.
+
+## Credits and license
+
+CleanFire Launcher is based on [Material TV Launcher](https://github.com/0xRampey/material-tv-launcher) by 0xRampey and contributors. Weather data is from [Open-Meteo](https://open-meteo.com/); IP location is from [ipdata.co](https://ipdata.co/). Bundled [material-color-utilities](https://github.com/material-foundation/material-color-utilities) is Apache 2.0 and [Google Sans Flex](https://github.com/googlefonts/googlesans-flex) is SIL Open Font License 1.1. See [NOTICE](NOTICE), [LICENSE](LICENSE), and bundled dependency notices. This fork is Apache 2.0; no Amazon, Google, or upstream endorsement is implied.

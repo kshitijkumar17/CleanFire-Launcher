@@ -52,7 +52,7 @@ final class ButtonGroup extends LinearLayout {
             b.setTypeface(face);
             b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
             b.setGravity(Gravity.CENTER);
-            b.setPadding(dp(20), dp(11), dp(22), dp(11));
+            b.setPadding(dp(20), 0, dp(22), 0);
             b.setFocusable(true);
             b.setClickable(true);
             Drawable icon = context.getDrawable(icons[i]);
@@ -63,11 +63,9 @@ final class ButtonGroup extends LinearLayout {
             }
             b.setOnClickListener(v -> listener.onPick(index));
             b.setOnFocusChangeListener((v, focused) -> {
-                v.animate().scaleX(focused ? 1.05f : 1f).scaleY(focused ? 1.05f : 1f)
-                        .setInterpolator(Motion.FAST_SPATIAL).setDuration(Motion.FAST_SPATIAL_MS).start();
                 restyle(index, true);
             });
-            LayoutParams lp = new LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT);
+            LayoutParams lp = new LayoutParams(LayoutParams.WRAP_CONTENT, dp(48));
             if (i > 0) lp.setMarginStart(dp(4));
             buttons.add(b);
             fills.add(Color.TRANSPARENT);
@@ -160,8 +158,8 @@ final class ButtonGroup extends LinearLayout {
             fillAnimators.set(i, null);
             TextView b = buttons.get(i);
             b.animate().cancel();
-            b.setScaleX(b.hasFocus() ? 1.05f : 1f);
-            b.setScaleY(b.hasFocus() ? 1.05f : 1f);
+            b.setScaleX(1f);
+            b.setScaleY(1f);
         }
     }
 

@@ -1,9 +1,14 @@
 package com.rampey.materialtv;
 
+import dev.karat.materialhome.R;
+
 import android.animation.ArgbEvaluator;
 import android.animation.ObjectAnimator;
 import android.animation.ValueAnimator;
+import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
+import android.app.Dialog;
 import android.app.PendingIntent;
 import android.content.ActivityNotFoundException;
 import android.content.ComponentName;
@@ -17,7 +22,10 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
+import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
+import android.media.AudioDeviceInfo;
+import android.media.AudioManager;
 import android.media.MediaMetadata;
 import android.media.tv.TvContract;
 import android.media.tv.TvInputInfo;
@@ -26,16 +34,25 @@ import android.media.session.MediaController;
 import android.media.session.MediaSessionManager;
 import android.media.session.PlaybackState;
 import android.net.Uri;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkInfo;
+import android.net.wifi.WifiInfo;
+import android.net.wifi.WifiManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
 import android.text.TextUtils;
 import android.util.TypedValue;
+import android.util.Log;
 import android.view.Gravity;
+import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.Window;
+import android.view.WindowManager;
 import android.view.animation.PathInterpolator;
 import android.view.inputmethod.EditorInfo;
 import android.widget.FrameLayout;
@@ -43,6 +60,7 @@ import android.widget.GridLayout;
 import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.PopupWindow;
 import android.widget.ScrollView;
 import android.widget.Space;
 import android.widget.TextView;
@@ -50,6 +68,7 @@ import android.widget.TextView;
 import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
+import java.text.Collator;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
@@ -65,7 +84,7 @@ import java.util.regex.Pattern;
 
 /**
  * A Material 3 Expressive home screen for TV: the background and accents take their color from the app in focus,
- * one dock of your most-used apps, everything else on an Apps page. No network, no tracking.
+ * one customizable dock and an alphabetical Apps page. Weather is the only network use.
  */
 public class HomeActivity extends Activity {
 
@@ -87,7 +106,7 @@ public class HomeActivity extends Activity {
     private ImageView shape;
     /**
      * The background shape drifts at 3 degrees a second, on every display frame (60 fps on a 60 Hz TV). It only runs
-     * while Home is on screen; the shape is a hardware layer, so each frame just rotates a texture.
+     * while Home is on screen; HWUI caches its display list and path mask between morphs.
      */
     private long driftLast;
     private static final long DRIFT_FRAME_MS = 0;   // every display frame (60 fps on a 60 Hz TV)
@@ -110,22 +129,62 @@ public class HomeActivity extends Activity {
         }
     };
     private GradientDrawable dockShape;
+    private FrameLayout homeDockFrame;
+    private TextView homeMoveBadge;
     private View homePage;
     private ScrollView appsPage;
+    private TextView appsTitle;
+    private ImageView appsEditButton;
+    private GradientDrawable appsEditShape;
+    private boolean appsEditMode;
+    private Set<String> appsHiddenDraft;
+    private ScrollView preferencesPage;
+    private LinearLayout preferencesColumn;
+    private LinearLayout homeSlots;
+    private TextView homeMoveHint;
+    private GridLayout visibilityRows;
+    private PopupWindow preferencesPopup;
+    private final Map<View, Runnable> longPressTasks = new HashMap<>();
+    private enum HomeDockState { NORMAL, CONTEXT_MENU, MOVING, REPLACEMENT_PICKER }
+    private HomeDockState homeDockState = HomeDockState.NORMAL;
+    private PopupWindow homeDockPopup;
+    private int homeOriginSlot = -1;
+    private int homeMovingSlot = -1;
+    private List<String> homeMoveOriginal;
+    private List<String> homeMoveDraft;
+    private HomePreferences choices;
+    private List<String> draftHome;
+    private Set<String> draftHidden;
+    private List<ResolveInfo> preferenceApps;
+    private int movingSlot = -1;
+    private List<String> moveOriginal;
     private GridLayout appsGrid;
     private LinearLayout dock;
     private TextView clock;
     private TextView date;
     private TextView focusTitle;
     private ButtonGroup nav;
+    private Dialog settingsDialog;
+    private View settingsWifiRow;
+    private boolean requestingWifiNamePermission;
+    private static final int WIFI_NAME_PERMISSION_REQUEST = 41;
 
     // Focus settles before the expensive part runs, so holding a direction stays smooth.
     private String pendingPkg;
     private CharSequence pendingLabel;
     private Drawable pendingArt;
+    private boolean focusPending;
+    private View lastFocusedView;
+    private final Map<View, Runnable> focusRestorers = new HashMap<>();
+    private final Map<GradientDrawable, ValueAnimator> ringAnimations = new HashMap<>();
+    private final Map<GradientDrawable, Integer> ringAlphas = new HashMap<>();
+    private Thread paletteWorker;
+    private volatile boolean paletteWorkAllowed;
+    private String shapePkg;
     private final Runnable settle = new Runnable() {
         @Override public void run() {
-            applyFocus(pendingPkg, pendingLabel, pendingArt);
+            focusPending = false;
+            if (foreground) applyFocus(pendingPkg, pendingLabel, pendingArt);
         }
     };
 
@@ -134,6 +193,31 @@ public class HomeActivity extends Activity {
     private ComponentName mediaListener;
     private MediaController playing;
     private View nowCard;
+    private WeatherRepository weatherRepository;
+    private ConnectivityManager weatherConnectivity;
+    private Network weatherNetwork;
+    private boolean weatherNetworkRegistered;
+    private final Runnable networkWeatherRefresh = () -> {
+        if (!weatherForeground()) return;
+        weatherRepository.requestNetworkLocationRefresh();
+        checkWeatherRefresh();
+    };
+    private final ConnectivityManager.NetworkCallback weatherNetworkCallback =
+            new ConnectivityManager.NetworkCallback() {
+                @Override public void onAvailable(Network network) {
+                    handler.post(() -> {
+                        if (!weatherForeground() || network.equals(weatherNetwork)) return;
+                        weatherNetwork = network;
+                        handler.removeCallbacks(networkWeatherRefresh);
+                        handler.postDelayed(networkWeatherRefresh, 5000);
+                    });
+                }
+            };
+    private View weatherView;
+    private WeatherIcon weatherIcon, weatherRainIcon;
+    private TextView weatherTitle, weatherTemp, weatherFeels, weatherRangeText, weatherRainChance, weatherAge;
+    private View weatherSeparator, weatherRangeSeparator, weatherRainSeparator;
+    private final Runnable weatherCheck = this::checkWeatherRefresh;
     private ImageView nowArt;
     private TextView nowTitle;
     private TextView nowArtist;
@@ -168,6 +252,9 @@ public class HomeActivity extends Activity {
 
     private void refreshDockSoon() {
         handler.removeCallbacks(refreshDock);
+        for (Runnable task : longPressTasks.values()) handler.removeCallbacks(task);
+        longPressTasks.clear();
+        if (preferencesPopup != null) preferencesPopup.dismiss();
         handler.postDelayed(refreshDock, 500);
     }
     private ImageView nowButton;
@@ -195,6 +282,29 @@ public class HomeActivity extends Activity {
     private String appsKey = "";
     private String dockKey = "";
     private ValueAnimator colorAnimator;
+    private ValueAnimator shapeAnimator, titleAnimator;
+    private final int[] gradientColors = new int[2];
+    private final List<ValueAnimator> transientAnimations = new ArrayList<>();
+
+    private void startTransient(ValueAnimator animation) {
+        transientAnimations.add(animation);
+        animation.addListener(new android.animation.AnimatorListenerAdapter() {
+            @Override public void onAnimationEnd(android.animation.Animator ended) {
+                transientAnimations.remove(animation);
+            }
+        });
+        animation.start();
+    }
+
+    private void setViewAnimationsActive(View view, boolean active) {
+        if (!active) view.animate().withEndAction(null).cancel();
+        if (view instanceof EqualizerBadge) ((EqualizerBadge) view).setAnimating(active);
+        if (view instanceof WavyProgress) ((WavyProgress) view).setAnimating(active);
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++) setViewAnimationsActive(group.getChildAt(i), active);
+        }
+    }
     private final Map<Integer, Typeface> clockFonts = new HashMap<>();
 
     /** Clock weight through the day: 250 at night, rising to 430 by mid-morning, easing back after sunset. */
@@ -238,7 +348,7 @@ public class HomeActivity extends Activity {
                     ValueAnimator swell = ValueAnimator.ofInt(base + 320, base).setDuration(700);
                     swell.setInterpolator(Motion.DEFAULT_SPATIAL);
                     swell.addUpdateListener(a -> clock.setTypeface(clockFont((int) a.getAnimatedValue())));
-                    swell.start();
+                    startTransient(swell);
                 }).start();
     }
 
@@ -260,13 +370,23 @@ public class HomeActivity extends Activity {
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
         pm = getPackageManager();
+        choices = new HomePreferences(this);
+        weatherRepository = new WeatherRepository(this);
+        ensureHomeMigration();
         setContentView(buildRoot());
     }
 
     @Override protected void onResume() {
         super.onResume();
+        foreground = true;
+        paletteWorkAllowed = true;
         fillDock();
         if (showingApps) fillApps();
+        restoreFocus();
+        if (focusPending) {
+            handler.removeCallbacks(settle);
+            handler.postDelayed(settle, 120);
+        }
         handler.removeCallbacks(tick);
         handler.post(tick);
         drifting = true;
@@ -277,9 +397,21 @@ public class HomeActivity extends Activity {
         handler.removeCallbacks(prebuildApps);
         handler.postDelayed(prebuildApps, 1500);
         foreground = true;
-        startNowPlaying();
-        android.media.tv.TvInputManager inputs = getSystemService(android.media.tv.TvInputManager.class);
-        if (inputs != null) {
+        setViewAnimationsActive(getWindow().getDecorView(), true);
+        renderWeather(weatherRepository.cached());
+        checkWeatherRefresh();
+        weatherConnectivity = getSystemService(ConnectivityManager.class);
+        if (weatherConnectivity != null && !weatherNetworkRegistered) {
+            try {
+                weatherNetwork = weatherConnectivity.getActiveNetwork();
+                weatherConnectivity.registerDefaultNetworkCallback(weatherNetworkCallback);
+                weatherNetworkRegistered = true;
+            } catch (SecurityException unavailable) {
+                Log.w("MaterialHomeWeather", "Network-change observation unavailable");
+            }
+        }
+        android.media.tv.TvInputManager inputs = HDMI_INPUTS_ENABLED ? getSystemService(android.media.tv.TvInputManager.class) : null;
+        if (HDMI_INPUTS_ENABLED && inputs != null) {
             inputs.registerCallback(inputCallback, handler);
             for (String id : deviceDots.keySet()) showDeviceState(id, inputs.getInputState(id));
         }
@@ -287,43 +419,104 @@ public class HomeActivity extends Activity {
 
     @Override protected void onPause() {
         super.onPause();
+        finishAppsEdit(false);
+        foreground = false;
+        if (!requestingWifiNamePermission && settingsDialog != null) settingsDialog.dismiss();
+        lastFocusedView = getCurrentFocus();
+        paletteWorkAllowed = false;
+        if (paletteWorker != null) paletteWorker.interrupt();
+        handler.removeCallbacks(refreshDock);
+        for (ValueAnimator animation : new ArrayList<>(transientAnimations)) animation.end();
+        setViewAnimationsActive(getWindow().getDecorView(), false);
+        // Cancelling a ViewPropertyAnimator preserves its intermediate values. Settle them
+        // offscreen so a return cannot leave a title/clock transparent or a tile half pressed.
+        for (Runnable restore : new ArrayList<>(focusRestorers.values())) restore.run();
+        clock.setAlpha(1f);
+        clock.setTranslationY(0f);
+        focusTitle.setAlpha(1f);
+        focusTitle.setTranslationY(0f);
         handler.removeCallbacks(tick);
         // Nothing animates while another app is on screen: no CPU or GPU use in the background.
         drifting = false;
         shape.removeCallbacks(drift);
         handler.removeCallbacks(prebuildApps);
+        handler.removeCallbacks(weatherCheck);
+        handler.removeCallbacks(networkWeatherRefresh);
+        if (weatherNetworkRegistered && weatherConnectivity != null) {
+            weatherConnectivity.unregisterNetworkCallback(weatherNetworkCallback);
+            weatherNetworkRegistered = false;
+        }
+        weatherRepository.cancel();
         if (colorAnimator != null) colorAnimator.end();
         nav.stopAnimations();
         handler.removeCallbacks(settle);
         // The media session stays watched (it only updates fields, never views) so the card remembers what played
         // while another app had the screen; it is let go in onDestroy.
-        foreground = false;
         handler.removeCallbacks(checkResumed);
-        android.media.tv.TvInputManager inputs = getSystemService(android.media.tv.TvInputManager.class);
-        if (inputs != null) inputs.unregisterCallback(inputCallback);
+        for (Runnable task : longPressTasks.values()) handler.removeCallbacks(task);
+        longPressTasks.clear();
+        if (preferencesPopup != null) preferencesPopup.dismiss();
+        clearHomeDockInteraction(false);
+        android.media.tv.TvInputManager inputs = HDMI_INPUTS_ENABLED ? getSystemService(android.media.tv.TvInputManager.class) : null;
+        if (HDMI_INPUTS_ENABLED && inputs != null) inputs.unregisterCallback(inputCallback);
         hideLoader();
     }
 
     @Override protected void onDestroy() {
-        stopNowPlaying();
+        weatherRepository.close();
         handler.removeCallbacks(expire);
-        handler.removeCallbacks(checkResumed);
+        handler.removeCallbacksAndMessages(null);
+        if (paletteWorker != null) paletteWorker.interrupt();
+        focusRestorers.clear();
+        ringAnimations.clear();
+        ringAlphas.clear();
+        lastFocusedView = null;
+        pendingArt = null;
         super.onDestroy();
     }
 
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
-        showHome();
+        setIntent(intent);
+        if (settingsDialog != null) settingsDialog.dismiss();
+        finishAppsEdit(false);
+        if (preferencesPage.getVisibility() == View.VISIBLE) leavePreferences();
+        else if (showingApps) showHome();
+        else restoreFocus();
+    }
+
+    @Override public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode != WIFI_NAME_PERMISSION_REQUEST) return;
+        requestingWifiNamePermission = false;
+        handler.postDelayed(this::refreshSettingsWifiName, 250);
+    }
+
+    private void restoreFocus() {
+        if (lastFocusedView != null && lastFocusedView.isAttachedToWindow() && lastFocusedView.isShown())
+            lastFocusedView.requestFocus();
     }
 
 
     @Override public void onBackPressed() {
-        if (showingApps) showHome();
+        if (homeDockState == HomeDockState.MOVING) cancelHomeDockMove();
+        else if (homeDockState != HomeDockState.NORMAL) clearHomeDockInteraction(true);
+        else if (movingSlot >= 0) cancelMove();
+        else if (preferencesPage.getVisibility() == View.VISIBLE) leavePreferences();
+        else if (showingApps && appsEditMode) {
+            finishAppsEdit(true);
+            appsEditButton.requestFocus();
+        }
+        else if (showingApps) showHome();
+        else super.onBackPressed();
     }
 
     @Override public boolean onKeyDown(int keyCode, KeyEvent event) {
         if (keyCode == KeyEvent.KEYCODE_MENU) {
-            if (showingApps) showHome(); else showApps();
+            if (homeDockState == HomeDockState.MOVING) { cancelHomeDockMove(); return true; }
+            if (homeDockState != HomeDockState.NORMAL) { clearHomeDockInteraction(true); return true; }
+            if (preferencesPage.getVisibility() == View.VISIBLE) leavePreferences();
+            else if (showingApps) showHome(); else showApps();
             return true;
         }
         return super.onKeyDown(keyCode, event);
@@ -337,7 +530,8 @@ public class HomeActivity extends Activity {
         root.setBackground(backdrop);
 
         // One Expressive "cookie" shape behind everything, drifting slowly and turning a little more when focus
-        // moves. It sits on its own GPU layer, so each step only moves the layer; nothing is redrawn.
+        // moves. Keep its hardware layer: direct path rendering raised CPU and missed frame
+        // deadlines on the target device, even when used only during morphs.
         cookie = new CookieDrawable(palette.primaryContainer, 9, 0.08f);
         ImageView big = new ImageView(this);
         big.setImageDrawable(cookie);
@@ -355,10 +549,11 @@ public class HomeActivity extends Activity {
         column.setClipToPadding(false);
         root.addView(column, match());
 
-        nowCard = buildNowPlaying();
-        FrameLayout.LayoutParams nowLp = new FrameLayout.LayoutParams(dp(380), ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.END | Gravity.TOP);
-        nowLp.setMargins(0, dp(140), dp(SIDE), 0);
-        root.addView(nowCard, nowLp);
+        weatherView = buildWeatherWidget();
+        FrameLayout.LayoutParams weatherLp = new FrameLayout.LayoutParams(dp(380), ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.END | Gravity.TOP);
+        // Match the tab strip's right edge: the page inset plus its 6 dp inner padding.
+        weatherLp.setMargins(0, dp(140), dp(SIDE + 6), 0);
+        root.addView(weatherView, weatherLp);
 
         column.addView(buildTopBar(), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
@@ -374,9 +569,22 @@ public class HomeActivity extends Activity {
         LinearLayout appsColumn = new LinearLayout(this);
         appsColumn.setOrientation(LinearLayout.VERTICAL);
         appsColumn.setClipChildren(false);
-        TextView appsTitle = text("All apps", 34, palette.onSurface, 760);
-        appsTitle.setPadding(dp(4), dp(28), 0, dp(8));
-        appsColumn.addView(appsTitle);
+        LinearLayout appsHeading = new LinearLayout(this);
+        appsHeading.setGravity(Gravity.CENTER_VERTICAL);
+        appsHeading.setPadding(dp(4), dp(28), 0, dp(8));
+        appsTitle = text("All apps", 34, palette.onSurface, 760);
+        appsHeading.addView(appsTitle, new LinearLayout.LayoutParams(0, -2, 1f));
+        appsEditButton = new ImageView(this);
+        appsEditButton.setImageResource(R.drawable.ic_tune);
+        appsEditButton.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        appsEditButton.setPadding(dp(11), dp(11), dp(11), dp(11));
+        appsEditButton.setFocusable(true);
+        appsEditButton.setClickable(true);
+        appsEditButton.setOnClickListener(v -> toggleAppsEdit());
+        appsEditButton.setOnFocusChangeListener((v, focused) -> styleAppsEditButton());
+        appsHeading.addView(appsEditButton, new LinearLayout.LayoutParams(dp(38), dp(38)));
+        styleAppsEditButton();
+        appsColumn.addView(appsHeading);
         appsGrid = new GridLayout(this);
         appsGrid.setColumnCount(5);
         appsGrid.setClipChildren(false);
@@ -385,6 +593,19 @@ public class HomeActivity extends Activity {
         appsPage.addView(appsColumn, new ScrollView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         appsPage.setVisibility(View.GONE);
         pages.addView(appsPage, match());
+        preferencesPage = new ScrollView(this);
+        preferencesPage.setFillViewport(true);
+        preferencesPage.setVerticalScrollBarEnabled(false);
+        preferencesPage.setClipChildren(false);
+        preferencesPage.setClipToPadding(false);
+        preferencesColumn = new LinearLayout(this);
+        preferencesColumn.setOrientation(LinearLayout.VERTICAL);
+        preferencesColumn.setClipChildren(false);
+        preferencesColumn.setClipToPadding(false);
+        preferencesColumn.setPadding(dp(4), dp(22), dp(4), dp(36));
+        preferencesPage.addView(preferencesColumn);
+        preferencesPage.setVisibility(View.GONE);
+        pages.addView(preferencesPage, match());
         return root;
     }
 
@@ -412,7 +633,7 @@ public class HomeActivity extends Activity {
                 index -> {
                     if (index == 0) showHome();
                     else if (index == 1) showApps();
-                    else launch(new Intent(Settings.ACTION_SETTINGS));
+                    else showSettingsPanel();
                 });
         nav.select(0);
         bar.addView(nav, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.END | Gravity.TOP));
@@ -436,7 +657,9 @@ public class HomeActivity extends Activity {
 
         // The dock: a rounded tonal container holding the favorites, like Material's floating toolbar.
         FrameLayout dockFrame = new FrameLayout(this);
+        homeDockFrame = dockFrame;
         dockFrame.setClipChildren(false);
+        dockFrame.setClipToPadding(false);
         dockShape = new GradientDrawable();
         dockShape.setCornerRadius(dp(40));
         dockShape.setColor(withAlpha(palette.container, 0xB3));
@@ -458,14 +681,29 @@ public class HomeActivity extends Activity {
 
     // ---- content ----
 
+    // Stick builds never enumerate, monitor or launch television HDMI inputs.
+    private static final boolean HDMI_INPUTS_ENABLED = false;
     private static final int DOCK_SIZE = 6;
+
+    /** Prefer TV entries, then include standard launcher entries used by Fire TV apps. */
+    private List<ResolveInfo> installedApps() {
+        Set<String> seen = new LinkedHashSet<>();
+        List<ResolveInfo> found = new ArrayList<>();
+        for (String category : new String[]{Intent.CATEGORY_LEANBACK_LAUNCHER, Intent.CATEGORY_LAUNCHER}) {
+            for (ResolveInfo info : pm.queryIntentActivities(new Intent(Intent.ACTION_MAIN).addCategory(category), 0)) {
+                String pkg = info.activityInfo.packageName;
+                if (!pkg.equals(getPackageName()) && seen.add(pkg)) found.add(info);
+            }
+        }
+        return found;
+    }
     /** Never in the dock: settings, the stock home screen and system helpers. */
     private static final java.util.Set<String> NOT_IN_DOCK = new java.util.HashSet<>(java.util.Arrays.asList(
             "com.android.tv.settings", "com.google.android.apps.tv.launcherx", "com.google.android.tungsten.setupwraith",
             "com.google.android.katniss", "com.android.vending", "com.android.systemui"));
 
-    /** The dock: most-used apps of the last 14 days (left = most used), topped up from the TV's other installed apps. */
-    private List<String> dockApps() {
+    /** Capture the old automatic order once so existing users keep their familiar dock. */
+    private List<String> initialDockApps() {
         List<String> out = new ArrayList<>();
         // Screensaver apps rack up "use" while the screensaver runs: they never count toward the dock.
         java.util.Set<String> screensavers = new java.util.HashSet<>();
@@ -509,7 +747,7 @@ public class HomeActivity extends Activity {
             } catch (RuntimeException ignored) {
             }
             List<String> rest = new ArrayList<>();
-            for (ResolveInfo info : pm.queryIntentActivities(new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER), 0)) {
+            for (ResolveInfo info : installedApps()) {
                 String pkg = info.activityInfo.packageName;
                 if (!out.contains(pkg) && !rest.contains(pkg) && !pkg.equals(getPackageName()) && !NOT_IN_DOCK.contains(pkg)
                         && !screensavers.contains(pkg) && !(devicesShown && pkg.equals(inputApp))) rest.add(pkg);
@@ -526,12 +764,38 @@ public class HomeActivity extends Activity {
         return out;
     }
 
+    private void ensureHomeMigration() {
+        if (choices.migrated()) return;
+        List<String> initial = new ArrayList<>(new LinkedHashSet<>(initialDockApps()));
+        for (ResolveInfo info : installedApps()) {
+            String pkg = info.activityInfo.packageName;
+            if (initial.size() >= DOCK_SIZE) break;
+            if (!pkg.equals(getPackageName()) && launchIntent(pkg) != null && !initial.contains(pkg)) initial.add(pkg);
+        }
+        while (initial.size() < DOCK_SIZE) initial.add("");
+        choices.save(initial.subList(0, DOCK_SIZE), Collections.emptySet());
+    }
+
+    private List<String> dockApps() {
+        List<String> saved = choices.home();
+        List<String> runtime = new ArrayList<>();
+        for (String pkg : saved) if (launchIntent(pkg) != null && !runtime.contains(pkg)) runtime.add(pkg);
+        if (runtime.size() < DOCK_SIZE) for (ResolveInfo info : installedApps()) {
+            String pkg = info.activityInfo.packageName;
+            if (runtime.size() >= DOCK_SIZE) break;
+            if (!pkg.equals(getPackageName()) && !NOT_IN_DOCK.contains(pkg)
+                    && launchIntent(pkg) != null && !runtime.contains(pkg)) runtime.add(pkg);
+        }
+        return runtime;
+    }
+
     /** CEC-named HDMI devices: dock key "input:<id>" -> {label, parent input id}. */
     private final Map<String, String[]> inputDevices = new HashMap<>();
 
     private List<String> cecDevices() {
         List<String> keys = new ArrayList<>();
         inputDevices.clear();
+        if (!HDMI_INPUTS_ENABLED) return keys;
         try {
             android.media.tv.TvInputManager tim = getSystemService(android.media.tv.TvInputManager.class);
             if (tim == null) return keys;
@@ -551,6 +815,7 @@ public class HomeActivity extends Activity {
 
     /** The app that plays HDMI inputs (the one a passthrough link opens), e.g. "Live TV". */
     private String inputApp() {
+        if (!HDMI_INPUTS_ENABLED) return null;
         ResolveInfo r = pm.resolveActivity(new Intent(Intent.ACTION_VIEW,
                 android.media.tv.TvContract.buildChannelUriForPassthroughInput("x")), 0);
         return r != null && r.activityInfo != null ? r.activityInfo.packageName : null;
@@ -587,7 +852,7 @@ public class HomeActivity extends Activity {
 
     private Intent dockIntent(String key) {
         String[] dev = inputDevices.get(key);
-        if (dev != null) return new Intent(Intent.ACTION_VIEW, android.media.tv.TvContract.buildChannelUriForPassthroughInput(dev[1]));
+        if (HDMI_INPUTS_ENABLED && dev != null) return new Intent(Intent.ACTION_VIEW, android.media.tv.TvContract.buildChannelUriForPassthroughInput(dev[1]));
         return launchIntent(key);
     }
 
@@ -600,7 +865,7 @@ public class HomeActivity extends Activity {
     }
 
     private void fillDock() {
-        List<String> present = dockApps();
+        List<String> present = homeDockState == HomeDockState.MOVING ? homeMoveDraft : dockApps();
         // Kept between visits; rebuild only when the dock's order or an HDMI device's name changes.
         StringBuilder names = new StringBuilder();
         for (String p : present) {
@@ -609,10 +874,17 @@ public class HomeActivity extends Activity {
         }
         String key = TextUtils.join(",", present) + names;
         if (key.equals(dockKey) && dock.getChildCount() > 0) {
-            if (!showingApps) dock.getChildAt(0).requestFocus();
+            warmPalettes(present);
+            // Retain existing nav focus too: focusing the first tile would queue a spurious retint.
+            if (!showingApps && getCurrentFocus() == null)
+                tileCard(dock.getChildAt(homeDockState == HomeDockState.MOVING ? homeMovingSlot : 0)).requestFocus();
             return;
         }
         dockKey = key;
+        if (homeMoveBadge != null) {
+            homeDockFrame.removeView(homeMoveBadge);
+            homeMoveBadge = null;
+        }
         dock.removeAllViews();
         dockBadges.clear();
         deviceDots.clear();
@@ -625,34 +897,311 @@ public class HomeActivity extends Activity {
         for (String pkg : present) {
             Intent intent = dockIntent(pkg);
             View tile = tile(pkg, intent, tileDp, true);
+            bindHomeDockKey(tileCard(tile), i);
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
             if (i > 0) lp.setMarginStart(dp(GAP));
             dock.addView(tile, lp);
             arrive(tile, i++);
         }
-        if (!showingApps && dock.getChildCount() > 0) dock.getChildAt(0).requestFocus();
+        if (!showingApps && dock.getChildCount() > 0)
+            tileCard(dock.getChildAt(homeDockState == HomeDockState.MOVING ? homeMovingSlot : 0)).requestFocus();
+        if (homeDockState == HomeDockState.MOVING)
+            showHomeMoveBadge(tileCard(dock.getChildAt(homeMovingSlot)));
         updateBadges();
     }
 
-    private void fillApps() {
-        Set<String> seen = new LinkedHashSet<>();
-        List<ResolveInfo> found = new ArrayList<>();
-        for (String category : new String[]{Intent.CATEGORY_LEANBACK_LAUNCHER, Intent.CATEGORY_LAUNCHER}) {
-            for (ResolveInfo info : pm.queryIntentActivities(new Intent(Intent.ACTION_MAIN).addCategory(category), 0)) {
-                String pkg = info.activityInfo.packageName;
-                if (pkg.equals(getPackageName()) || !seen.add(pkg)) continue;
-                found.add(info);
+    private void showHomeMoveBadge(View anchor) {
+        TextView mark = text("↔", 19, palette.inverseOnSurface, 700);
+        mark.setGravity(Gravity.CENTER);
+        GradientDrawable shape = new GradientDrawable();
+        shape.setShape(GradientDrawable.OVAL);
+        shape.setColor(palette.inverseSurface);
+        mark.setBackground(shape);
+        mark.setFocusable(false);
+        homeMoveBadge = mark;
+        homeDockFrame.addView(mark, new FrameLayout.LayoutParams(dp(30), dp(30)));
+        // The scroll view clips descendants outside its viewport. Position this sibling
+        // in screen coordinates so the badge can float above the selected tile.
+        homeDockFrame.post(() -> {
+            if (homeMoveBadge != mark || homeDockState != HomeDockState.MOVING) return;
+            int[] tileLocation = new int[2], frameLocation = new int[2];
+            anchor.getLocationOnScreen(tileLocation);
+            homeDockFrame.getLocationOnScreen(frameLocation);
+            mark.setX(tileLocation[0] - frameLocation[0] + (anchor.getWidth() - dp(30)) / 2f);
+            mark.setY(tileLocation[1] - frameLocation[1] - dp(63));
+        });
+    }
+
+    private void bindHomeDockKey(View card, int slot) {
+        final boolean[] pressed = {false};
+        final boolean[] longOpened = {false};
+        Runnable timeout = () -> {
+            longPressTasks.remove(card);
+            if (pressed[0] && card.hasFocus() && homeDockState == HomeDockState.NORMAL) {
+                longOpened[0] = true;
+                showHomeDockMenu(card, slot);
             }
+        };
+        card.setOnKeyListener((v, key, event) -> {
+            if (homeDockState == HomeDockState.MOVING) {
+                if (key == KeyEvent.KEYCODE_DPAD_LEFT || key == KeyEvent.KEYCODE_DPAD_RIGHT) {
+                    if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0)
+                        shiftHomeDock(key == KeyEvent.KEYCODE_DPAD_LEFT ? -1 : 1);
+                    return true;
+                }
+                if (key == KeyEvent.KEYCODE_DPAD_UP || key == KeyEvent.KEYCODE_DPAD_DOWN) return true;
+            }
+            if (key != KeyEvent.KEYCODE_DPAD_CENTER && key != KeyEvent.KEYCODE_ENTER) return false;
+            if (event.getAction() == KeyEvent.ACTION_DOWN) {
+                if (!pressed[0]) {
+                    pressed[0] = true;
+                    longOpened[0] = false;
+                    if (homeDockState == HomeDockState.NORMAL) {
+                        longPressTasks.put(card, timeout);
+                        handler.postDelayed(timeout, android.view.ViewConfiguration.getLongPressTimeout());
+                    }
+                }
+                if (homeDockState == HomeDockState.NORMAL && !longOpened[0]
+                        && (event.isLongPress() || event.getRepeatCount() > 0)) {
+                    handler.removeCallbacks(timeout);
+                    longPressTasks.remove(card);
+                    longOpened[0] = true;
+                    showHomeDockMenu(card, slot);
+                }
+                return true;
+            }
+            if (event.getAction() == KeyEvent.ACTION_UP) {
+                pressed[0] = false;
+                handler.removeCallbacks(timeout);
+                longPressTasks.remove(card);
+                if (homeDockState == HomeDockState.MOVING) confirmHomeDockMove();
+                else if (!longOpened[0] && homeDockState == HomeDockState.NORMAL && card.hasFocus())
+                    card.performClick();
+                return true;
+            }
+            return true;
+        });
+        card.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+            @Override public void onViewAttachedToWindow(View v) { }
+            @Override public void onViewDetachedFromWindow(View v) {
+                handler.removeCallbacks(timeout);
+                longPressTasks.remove(card);
+            }
+        });
+    }
+
+    private void showHomeDockMenu(View anchor, int slot) {
+        if (homeDockState != HomeDockState.NORMAL || homeDockPopup != null) return;
+        homeOriginSlot = slot;
+        homeDockState = HomeDockState.CONTEXT_MENU;
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setPadding(dp(12), dp(9), dp(12), dp(9));
+        GradientDrawable surface = new GradientDrawable();
+        surface.setColor(palette.container);
+        surface.setCornerRadius(dp(22));
+        content.setBackground(surface);
+        TextView move = preferenceButton("Move", () -> beginHomeDockMove(slot));
+        TextView replace = preferenceButton("Replace", () -> openHomeDockPicker(slot));
+        move.setGravity(Gravity.CENTER);
+        replace.setGravity(Gravity.CENTER);
+        move.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        replace.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        move.setPadding(dp(6), 0, dp(6), 0);
+        replace.setPadding(dp(6), 0, dp(6), 0);
+        LinearLayout.LayoutParams moveParams = new LinearLayout.LayoutParams(-1, dp(27));
+        moveParams.bottomMargin = dp(8);
+        content.addView(move, moveParams);
+        content.addView(replace, new LinearLayout.LayoutParams(-1, dp(27)));
+        int width = Math.min(dp(154), anchor.getWidth() - dp(8));
+        int height = dp(80);
+        int[] location = new int[2];
+        anchor.getLocationOnScreen(location);
+        int screenWidth = getResources().getDisplayMetrics().widthPixels;
+        int x = Math.max(dp(SIDE), Math.min(location[0] + (anchor.getWidth() - width) / 2,
+                screenWidth - dp(SIDE) - width));
+        int y = Math.max(dp(16), location[1] - height - dp(10));
+        PopupWindow popup = new PopupWindow(content, width, height, true);
+        popup.setBackgroundDrawable(surface);
+        popup.setOutsideTouchable(true);
+        popup.setElevation(dp(20));
+        popup.setAnimationStyle(android.R.style.Animation_Dialog);
+        popup.setOnDismissListener(() -> {
+            if (homeDockPopup == popup) homeDockPopup = null;
+            if (homeDockState == HomeDockState.CONTEXT_MENU) {
+                homeDockState = HomeDockState.NORMAL;
+                if (anchor.isAttachedToWindow() && homePage.isShown()) anchor.requestFocus();
+            }
+        });
+        homeDockPopup = popup;
+        popup.showAtLocation(homePage, Gravity.TOP | Gravity.LEFT, x, y);
+        move.requestFocus();
+    }
+
+    private void beginHomeDockMove(int slot) {
+        homeMoveOriginal = new ArrayList<>(dockApps());
+        homeMoveDraft = new ArrayList<>(homeMoveOriginal);
+        homeMovingSlot = slot;
+        homeDockState = HomeDockState.MOVING;
+        if (homeDockPopup != null) homeDockPopup.dismiss();
+        dockKey = null;
+        fillDock();
+    }
+
+    private void shiftHomeDock(int direction) {
+        int other = homeMovingSlot + direction;
+        if (other < 0 || other >= DOCK_SIZE) return;
+        Collections.swap(homeMoveDraft, homeMovingSlot, other);
+        homeMovingSlot = other;
+        dockKey = null;
+        fillDock();
+    }
+
+    private void confirmHomeDockMove() {
+        int slot = homeMovingSlot;
+        choices.save(homeMoveDraft, choices.hidden());
+        homeDockState = HomeDockState.NORMAL;
+        homeMoveOriginal = null;
+        homeMoveDraft = null;
+        homeMovingSlot = -1;
+        dockKey = null;
+        fillDock();
+        tileCard(dock.getChildAt(slot)).requestFocus();
+    }
+
+    private void cancelHomeDockMove() {
+        int slot = homeOriginSlot;
+        homeDockState = HomeDockState.NORMAL;
+        homeMoveDraft = null;
+        homeMoveOriginal = null;
+        homeMovingSlot = -1;
+        dockKey = null;
+        fillDock();
+        if (slot >= 0 && slot < dock.getChildCount()) tileCard(dock.getChildAt(slot)).requestFocus();
+    }
+
+    private void focusHomeDockSlot(int slot) {
+        dock.post(() -> {
+            if (slot >= 0 && slot < dock.getChildCount() && homePage.isShown()) {
+                View card = tileCard(dock.getChildAt(slot));
+                card.clearFocus();
+                card.requestFocus();
+            }
+        });
+    }
+
+    private void clearHomeDockInteraction(boolean restoreFocus) {
+        if (homeDockState == HomeDockState.NORMAL && homeDockPopup == null) return;
+        int slot = homeOriginSlot;
+        boolean wasMoving = homeDockState == HomeDockState.MOVING;
+        homeDockState = HomeDockState.NORMAL;
+        homeMoveDraft = null;
+        homeMoveOriginal = null;
+        homeMovingSlot = -1;
+        PopupWindow popup = homeDockPopup;
+        homeDockPopup = null;
+        if (popup != null) popup.dismiss();
+        if (wasMoving && foreground) { dockKey = null; fillDock(); }
+        if (restoreFocus) focusHomeDockSlot(slot);
+    }
+
+    private void openHomeDockPicker(int slot) {
+        List<ResolveInfo> candidates = installedApps();
+        Set<String> hidden = choices.hidden();
+        candidates.removeIf(info -> hidden.contains(info.activityInfo.packageName)
+                || launchIntent(info.activityInfo.packageName) == null);
+        Collator collator = Collator.getInstance();
+        collator.setStrength(Collator.PRIMARY);
+        Map<String, String> labels = new HashMap<>();
+        for (ResolveInfo info : candidates)
+            labels.put(info.activityInfo.packageName, String.valueOf(info.loadLabel(pm)));
+        candidates.sort((a, b) -> {
+            String ap = a.activityInfo.packageName, bp = b.activityInfo.packageName;
+            int result = collator.compare(labels.get(ap), labels.get(bp));
+            return result != 0 ? result : ap.compareTo(bp);
+        });
+        if (candidates.isEmpty()) {
+            clearHomeDockInteraction(true);
+            android.widget.Toast.makeText(this, "No visible apps available", android.widget.Toast.LENGTH_LONG).show();
+            return;
         }
+        homeDockState = HomeDockState.REPLACEMENT_PICKER;
+        if (homeDockPopup != null) homeDockPopup.dismiss();
+        GridLayout grid = new GridLayout(this);
+        grid.setColumnCount(6);
+        grid.setClipChildren(false);
+        grid.setClipToPadding(false);
+        int screenDp = (int) (getResources().getDisplayMetrics().widthPixels / getResources().getDisplayMetrics().density);
+        int popupDp = Math.min(850, screenDp - 2 * SIDE);
+        int tileDp = Math.max(90, (popupDp - 48 - 6 * (2 * RING + 16)) / 6);
+        for (ResolveInfo info : candidates) {
+            String pkg = info.activityInfo.packageName;
+            View holder = tile(pkg, launchIntent(pkg), tileDp, false, v -> replaceHomeDockApp(slot, pkg));
+            GridLayout.LayoutParams lp = new GridLayout.LayoutParams();
+            lp.setMargins(dp(8), dp(8), dp(8), dp(8));
+            grid.addView(holder, lp);
+        }
+        ScrollView scroll = new ScrollView(this);
+        scroll.setClipChildren(false);
+        scroll.setClipToPadding(false);
+        scroll.setPadding(dp(24), dp(24), dp(24), dp(24));
+        scroll.addView(grid);
+        GradientDrawable surface = new GradientDrawable();
+        surface.setColor(palette.container);
+        surface.setCornerRadius(dp(32));
+        scroll.setBackground(surface);
+        int rows = (candidates.size() + 5) / 6;
+        int height = Math.min(430, Math.max(160, rows * (tileDp * 9 / 16 + 2 * RING + 16) + 48));
+        PopupWindow picker = new PopupWindow(scroll, dp(popupDp), dp(height), true);
+        picker.setBackgroundDrawable(surface);
+        picker.setOutsideTouchable(true);
+        picker.setElevation(dp(24));
+        picker.setAnimationStyle(android.R.style.Animation_Dialog);
+        picker.setOnDismissListener(() -> {
+            if (homeDockPopup == picker) homeDockPopup = null;
+            if (homeDockState == HomeDockState.REPLACEMENT_PICKER) {
+                homeDockState = HomeDockState.NORMAL;
+                focusHomeDockSlot(slot);
+            }
+        });
+        homeDockPopup = picker;
+        picker.showAtLocation(homePage, Gravity.CENTER, 0, 0);
+        tileCard(grid.getChildAt(0)).requestFocus();
+    }
+
+    private void replaceHomeDockApp(int slot, String pkg) {
+        List<String> updated = new ArrayList<>(choices.home());
+        int prior = updated.indexOf(pkg);
+        if (prior >= 0 && prior != slot) updated.set(prior, updated.get(slot));
+        updated.set(slot, pkg);
+        choices.save(updated, choices.hidden());
+        homeDockState = HomeDockState.NORMAL;
+        if (homeDockPopup != null) homeDockPopup.dismiss();
+        dockKey = null;
+        fillDock();
+        if (slot < dock.getChildCount()) tileCard(dock.getChildAt(slot)).requestFocus();
+    }
+
+    private void fillApps() {
+        List<ResolveInfo> found = installedApps();
+        Set<String> seen = new LinkedHashSet<>();
+        Set<String> hidden = appsEditMode ? appsHiddenDraft : choices.hidden();
+        for (ResolveInfo info : found)
+            if (appsEditMode || !hidden.contains(info.activityInfo.packageName)) seen.add(info.activityInfo.packageName);
         // The grid is kept between visits; rebuild only when the set of installed apps changed.
-        String key = TextUtils.join(",", seen);
+        String key = (appsEditMode ? "edit:" : "view:") + TextUtils.join(",", seen);
         if (key.equals(appsKey) && appsGrid.getChildCount() > 0) return;
         appsKey = key;
         appsGrid.removeAllViews();
         // Read each label once (loading a label is slow), then sort.
         Map<ResolveInfo, String> labels = new HashMap<>();
         for (ResolveInfo info : found) labels.put(info, String.valueOf(info.loadLabel(pm)));
-        Collections.sort(found, (a, b) -> labels.get(a).compareToIgnoreCase(labels.get(b)));
+        Collator collator = Collator.getInstance();
+        collator.setStrength(Collator.PRIMARY);
+        Collections.sort(found, (a, b) -> {
+            int order = collator.compare(labels.get(a), labels.get(b));
+            return order != 0 ? order : a.activityInfo.packageName.compareTo(b.activityInfo.packageName);
+        });
         // Five columns that exactly fill the width between the side margins (tile + focus-ring room + gaps).
         int cols = appsGrid.getColumnCount();
         float screenDp = getResources().getDisplayMetrics().widthPixels / getResources().getDisplayMetrics().density;
@@ -660,17 +1209,70 @@ public class HomeActivity extends Activity {
         int tileDp = (int) Math.min(170, inner / cols);
         for (ResolveInfo info : found) {
             String pkg = info.activityInfo.packageName;
+            if (!appsEditMode && hidden.contains(pkg)) continue;
             Intent intent = launchIntent(pkg);
             if (intent == null) continue;
-            View tile = tile(pkg, intent, tileDp, false);
+            View tile = appsEditMode ? tile(pkg, intent, tileDp, false, v -> {
+                if (!appsHiddenDraft.add(pkg)) appsHiddenDraft.remove(pkg);
+                setAppsTileHidden((View) v.getParent().getParent(), appsHiddenDraft.contains(pkg), pkg);
+            }) : tile(pkg, intent, tileDp, false);
+            if (appsEditMode) {
+                FrameLayout card = (FrameLayout) tileCard(tile);
+                ImageView badge = new ImageView(this);
+                badge.setImageResource(R.drawable.ic_visibility_off);
+                badge.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+                badge.setPadding(dp(4), dp(4), dp(4), dp(4));
+                GradientDrawable background = new GradientDrawable();
+                background.setShape(GradientDrawable.OVAL);
+                badge.setBackground(background);
+                FrameLayout.LayoutParams badgeLp = new FrameLayout.LayoutParams(dp(23), dp(23), Gravity.END | Gravity.TOP);
+                badgeLp.setMargins(0, dp(6), dp(6), 0);
+                card.addView(badge, badgeLp);
+                setAppsTileHidden(tile, hidden.contains(pkg), pkg);
+            }
+            TextView name = text(labels.get(info), 14, palette.onSurfaceVariant, 500);
+            name.setSingleLine(true);
+            name.setEllipsize(TextUtils.TruncateAt.END);
+            name.setGravity(Gravity.CENTER);
+            LinearLayout.LayoutParams nameLp = new LinearLayout.LayoutParams(dp(tileDp + 2 * RING), dp(25));
+            nameLp.topMargin = dp(3);
+            ((LinearLayout) tile).addView(name, nameLp);
             GridLayout.LayoutParams lp = new GridLayout.LayoutParams();
-            lp.setMargins(dp(APP_MARGIN), dp(10), dp(APP_MARGIN), dp(16));
+            lp.setMargins(dp(APP_MARGIN), dp(10), dp(APP_MARGIN), dp(10));
             appsGrid.addView(tile, lp);
         }
     }
 
-    /** A 16:9 card: the app's TV banner, or its icon on a tonal card, with the name underneath. */
+    /** Scroll the complete focused row, including its labels and animated focus rings, into view. */
+    private void keepAppsRowVisible(View tile) {
+        if (!tile.hasFocus() || appsPage.getVisibility() != View.VISIBLE) return;
+        int[] rowPosition = new int[2];
+        int[] viewportPosition = new int[2];
+        tile.getLocationOnScreen(rowPosition);
+        appsPage.getLocationOnScreen(viewportPosition);
+        int top = rowPosition[1] - viewportPosition[1];
+        int bottom = top + tile.getHeight();
+        int inset = dp(14);
+        int delta = top < inset ? top - inset :
+                bottom > appsPage.getHeight() - inset ? bottom - (appsPage.getHeight() - inset) : 0;
+        if (delta != 0) appsPage.smoothScrollBy(0, delta);
+    }
+
+    private void setAppsTileHidden(View holder, boolean hidden, String pkg) {
+        setHiddenArtwork(holder, hidden, pkg);
+        FrameLayout card = (FrameLayout) tileCard(holder);
+        ImageView badge = (ImageView) card.getChildAt(1);
+        badge.setVisibility(hidden ? View.VISIBLE : View.GONE);
+        badge.setImageTintList(ColorStateList.valueOf(palette.inverseOnSurface));
+        ((GradientDrawable) badge.getBackground()).setColor(palette.inverseSurface);
+    }
+
+    /** A 16:9 card: the app's TV banner, or its icon on a tonal card. */
     private View tile(String pkg, Intent intent, int widthDp, boolean inDock) {
+        return tile(pkg, intent, widthDp, inDock, null);
+    }
+
+    private View tile(String pkg, Intent intent, int widthDp, boolean inDock, View.OnClickListener preferenceClick) {
         int w = dp(widthDp);
         int h = w * 9 / 16;
         int radius = dp(Focus.MEDIA);
@@ -695,13 +1297,16 @@ public class HomeActivity extends Activity {
         }
         final CharSequence label = name;
         final Drawable art = banner != null ? banner : icon;
+        final boolean fullBleedBanner = banner != null;
 
         FrameLayout card = new FrameLayout(this);
         card.setFocusable(true);
         card.setClickable(true);
         GradientDrawable cardShape = new GradientDrawable();
         cardShape.setCornerRadius(radius);
-        cardShape.setColor(palette.containerHigh);
+        // Banners may already have transparent rounded corners. A tinted backing shows
+        // through those pixels as protruding corner patches inside the focus ring.
+        cardShape.setColor(banner != null ? Color.TRANSPARENT : palette.containerHigh);
         card.setBackground(cardShape);
         card.setClipToOutline(true);
         ImageView image = new ImageView(this);
@@ -733,54 +1338,45 @@ public class HomeActivity extends Activity {
         loader.setImageDrawable(loaderShape);
         loader.setVisibility(View.GONE);
         ringFrame.addView(loader, new FrameLayout.LayoutParams(dp(48), dp(48), Gravity.CENTER));
-        card.setOnClickListener(v -> pressAndLaunch(ringFrame, loader, loaderShape, intent));
+        card.setOnClickListener(preferenceClick != null ? preferenceClick
+                : v -> pressAndLaunch(ringFrame, loader, loaderShape, intent));
 
-        TextView caption = text(label, inDock ? 15 : 14, palette.onSurfaceVariant, 560);
-        caption.setGravity(Gravity.CENTER_HORIZONTAL);
-        caption.setSingleLine(true);
-        caption.setEllipsize(TextUtils.TruncateAt.END);
-        caption.setPadding(0, dp(10), 0, 0);
-        caption.setAlpha(inDock ? 0f : 0.85f);
-
+        final ValueAnimator[] cornerAnimation = new ValueAnimator[1];
         card.setOnFocusChangeListener((v, focused) -> {
+            if (!focused) {
+                Runnable pendingLongPress = longPressTasks.remove(card);
+                if (pendingLongPress != null) handler.removeCallbacks(pendingLongPress);
+            }
             float scale = focused ? 1.10f : 1f;
             ringFrame.animate().scaleX(scale).scaleY(scale)
                     .setInterpolator(Motion.FAST_SPATIAL).setDuration(Motion.FAST_SPATIAL_MS).start();
             // A glow in the app's own color (TV focus guidance) instead of a dark shadow.
             card.setOutlineSpotShadowColor(palette.primary);
             card.setOutlineAmbientShadowColor(palette.primary);
-            card.animate().translationZ(focused ? dp(14) : 0)
+            // An icon-only tile has a solid backing. Its colored elevation shadow leaks into
+            // the rounded ring gap as corner patches, so reserve the glow for full-bleed banners.
+            card.animate().translationZ(focused && fullBleedBanner ? dp(14) : 0)
                     .setInterpolator(Motion.FAST_EFFECTS).setDuration(Motion.DEFAULT_EFFECTS_MS).start();
+            if (cornerAnimation[0] != null) cornerAnimation[0].cancel();
             ObjectAnimator corners = ObjectAnimator.ofFloat(cardShape, "cornerRadius", cardShape.getCornerRadius(), focused ? radius * 0.62f : radius)
                     .setDuration(Motion.FAST_SPATIAL_MS);
             corners.setInterpolator(Motion.FAST_SPATIAL);
-            corners.start();
-            ring.setCornerRadius((focused ? radius * 0.62f : radius) + dp(RING));
+            corners.addUpdateListener(an -> ring.setCornerRadius(cardShape.getCornerRadius() + dp(RING)));
+            cornerAnimation[0] = corners;
+            startTransient(corners);
             fadeRing(ring, focused);
             if (inDock) shiftNeighbors(holder, focused);
-            caption.animate().cancel();
-            if (inDock && focused) {
-                caption.setVisibility(View.VISIBLE);
-                caption.animate().alpha(1f).setInterpolator(Motion.FAST_EFFECTS).setDuration(Motion.FAST_EFFECTS_MS).start();
-            } else if (inDock) {
-                caption.animate().alpha(0f).setInterpolator(Motion.FAST_EFFECTS).setDuration(Motion.FAST_EFFECTS_MS)
-                        .withEndAction(() -> caption.setVisibility(View.GONE)).start();
-            } else {
-                caption.animate().alpha(focused ? 1f : 0.85f).setInterpolator(Motion.FAST_EFFECTS).setDuration(Motion.FAST_EFFECTS_MS).start();
-            }
-            caption.setTextColor(focused ? palette.onSurface : palette.onSurfaceVariant);
             if (focused) onTileFocused(pkg, label, art);
+            if (focused && holder.getParent() == appsGrid)
+                appsPage.post(() -> keepAppsRowVisible(holder));
         });
 
-        // Status lives under the tile, never on the artwork: an equalizer for the app that's playing, a green dot for
-        // an HDMI device that's on. Focused, the name appears beside it.
+        // Status marks remain below the dock tile when active, without reserving an empty label row.
         LinearLayout captionRow = new LinearLayout(this);
         captionRow.setOrientation(LinearLayout.HORIZONTAL);
         captionRow.setGravity(Gravity.CENTER);
         captionRow.setClipChildren(false);
-        caption.setPadding(0, 0, 0, 0);
-        caption.setMaxWidth(w + dp(48) - dp(30));
-        if (inDock) caption.setVisibility(View.GONE);
+        captionRow.setVisibility(View.GONE);
         if (inDock && device != null) {
             View dot = new View(this);
             GradientDrawable dotShape = new GradientDrawable();
@@ -799,31 +1395,76 @@ public class HomeActivity extends Activity {
         if (inDock) {
             EqualizerBadge badge = new EqualizerBadge(this);
             badge.setVisibility(View.GONE);
+            badge.setAnimating(foreground);
             badge.setColors(0x00000000, 0xFFE6E1E5);
             LinearLayout.LayoutParams bl = new LinearLayout.LayoutParams(dp(18), dp(22));
             bl.setMarginEnd(dp(6));
             captionRow.addView(badge, bl);
             dockBadges.put(pkg, badge);
         }
-        captionRow.addView(caption, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         holder.addView(ringFrame, new LinearLayout.LayoutParams(w + dp(2 * RING), h + dp(2 * RING)));
-        // Fixed height so the dock never jumps; a little wider than the tile (negative margins keep the spacing) so a
-        // name with a status mark beside it still fits.
-        LinearLayout.LayoutParams rl = new LinearLayout.LayoutParams(w + dp(48), dp(32));
-        rl.topMargin = dp(8);
-        rl.leftMargin = -dp(24);
-        rl.rightMargin = -dp(24);
-        holder.addView(captionRow, rl);
+        if (inDock) {
+            LinearLayout.LayoutParams rl = new LinearLayout.LayoutParams(w + dp(2 * RING), dp(22));
+            rl.topMargin = dp(6);
+            holder.addView(captionRow, rl);
+        }
+        Runnable restore = () -> {
+            boolean focused = card.hasFocus();
+            ringFrame.setScaleX(focused ? 1.10f : 1f);
+            ringFrame.setScaleY(focused ? 1.10f : 1f);
+            card.setTranslationZ(focused && fullBleedBanner ? dp(14) : 0f);
+            cardShape.setCornerRadius(focused ? radius * 0.62f : radius);
+            ring.setCornerRadius((focused ? radius * 0.62f : radius) + dp(RING));
+            ring.setStroke(dp(3), focused ? palette.inverseSurface : Color.TRANSPARENT);
+            ringAlphas.put(ring, focused ? 255 : 0);
+            holder.setAlpha(1f);
+            holder.setTranslationY(0f);
+            holder.animate().setStartDelay(0);
+            float dx = 0f;
+            if (inDock) {
+                int at = dock.indexOfChild(holder);
+                if (at > 0 && dock.getChildAt(at - 1).hasFocus()) dx = dp(8);
+                if (at + 1 < dock.getChildCount() && dock.getChildAt(at + 1).hasFocus()) dx = -dp(8);
+            }
+            holder.setTranslationX(dx);
+        };
+        focusRestorers.put(holder, restore);
+        holder.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+            @Override public void onViewAttachedToWindow(View v) {
+                focusRestorers.put(holder, restore);
+            }
+            @Override public void onViewDetachedFromWindow(View v) {
+                focusRestorers.remove(holder);
+                if (cornerAnimation[0] != null) cornerAnimation[0].cancel();
+                ValueAnimator ringAnimation = ringAnimations.remove(ring);
+                if (ringAnimation != null) ringAnimation.cancel();
+                ringAlphas.remove(ring);
+                setViewAnimationsActive(holder, false);
+            }
+        });
         return holder;
     }
 
     /** The focus ring fades in (fast effects) in the palette's focus color instead of snapping on. */
     private void fadeRing(GradientDrawable ring, boolean focused) {
+        ValueAnimator previous = ringAnimations.remove(ring);
+        if (previous != null) previous.cancel();
         int color = palette.inverseSurface;
-        ValueAnimator a = ValueAnimator.ofInt(focused ? 0 : 255, focused ? 255 : 0).setDuration(Motion.FAST_EFFECTS_MS);
+        int alpha = ringAlphas.getOrDefault(ring, 0);
+        ValueAnimator a = ValueAnimator.ofInt(alpha, focused ? 255 : 0).setDuration(Motion.FAST_EFFECTS_MS);
+        ringAnimations.put(ring, a);
+        a.addListener(new android.animation.AnimatorListenerAdapter() {
+            @Override public void onAnimationEnd(android.animation.Animator ended) {
+                if (ringAnimations.get(ring) == a) ringAnimations.remove(ring);
+            }
+        });
         a.setInterpolator(Motion.FAST_EFFECTS);
-        a.addUpdateListener(an -> ring.setStroke(dp(3), (color & 0x00FFFFFF) | ((int) an.getAnimatedValue() << 24)));
-        a.start();
+        a.addUpdateListener(an -> {
+            int value = (int) an.getAnimatedValue();
+            ringAlphas.put(ring, value);
+            ring.setStroke(dp(3), (color & 0x00FFFFFF) | (value << 24));
+        });
+        startTransient(a);
     }
 
     /** Standard button-group behavior on the dock: the neighbors of the focused tile make a little room. */
@@ -871,7 +1512,7 @@ public class HomeActivity extends Activity {
             shape.morphTo(seq[0], 0.18f);
             loaderAnim.addUpdateListener(an -> {
                 shape.setProgress((float) an.getAnimatedValue());
-                loader.setRotation(loader.getRotation() + 2.5f);
+                loader.setRotation((an.getCurrentPlayTime() * 0.15f) % 360f);
             });
             loaderAnim.start();
         };
@@ -881,11 +1522,17 @@ public class HomeActivity extends Activity {
     private void hideLoader() {
         if (pendingLoader[0] != null) handler.removeCallbacks(pendingLoader[0]);
         if (loaderAnim != null) loaderAnim.cancel();
-        if (activeLoader != null) activeLoader.setVisibility(View.GONE);
+        loaderAnim = null;
+        pendingLoader[0] = null;
+        if (activeLoader != null) {
+            activeLoader.animate().withEndAction(null).cancel();
+            activeLoader.setVisibility(View.GONE);
+        }
         activeLoader = null;
     }
 
     private void onTileFocused(String pkg, CharSequence label, Drawable art) {
+        focusPending = true;
         pendingPkg = pkg;
         pendingLabel = label;
         pendingArt = art;
@@ -923,8 +1570,13 @@ public class HomeActivity extends Activity {
 
     /** Work out every favorite's colors on a background thread, so the first focus on each app costs nothing. */
     private void warmPalettes(List<String> packages) {
-        new Thread(() -> {
+        if (!paletteWorkAllowed || (paletteWorker != null && paletteWorker.isAlive())) return;
+        boolean missing = false;
+        for (String pkg : packages) if (!seedCache.containsKey(pkg)) { missing = true; break; }
+        if (!missing) return;
+        paletteWorker = new Thread(() -> {
             for (String pkg : packages) {
+                if (!paletteWorkAllowed || Thread.currentThread().isInterrupted()) return;
                 if (seedCache.containsKey(pkg)) continue;
                 try {
                     ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
@@ -936,15 +1588,18 @@ public class HomeActivity extends Activity {
                 } catch (PackageManager.NameNotFoundException | RuntimeException ignored) {
                 }
             }
-        }, "palette-warmup").start();
+        }, "palette-warmup");
+        paletteWorker.start();
     }
 
     /** Expressive type: the app name lands a little lighter and settles into its full weight. */
     private void animateTitleWeight() {
+        if (titleAnimator != null) titleAnimator.cancel();
         ValueAnimator a = ValueAnimator.ofInt(0, 6).setDuration(Motion.DEFAULT_SPATIAL_MS);
         a.setInterpolator(Motion.DEFAULT_EFFECTS);
         a.addUpdateListener(an -> focusTitle.setTypeface(titleFont(560 + 30 * (int) an.getAnimatedValue())));
-        a.start();
+        titleAnimator = a;
+        startTransient(a);
     }
 
     private Typeface titleFont(int weight) {
@@ -963,17 +1618,21 @@ public class HomeActivity extends Activity {
 
     /** Each app gets its own Expressive shape; moving between apps morphs one outline into the next. */
     private void morphShape(String pkg) {
+        if (pkg.equals(shapePkg)) return;
+        shapePkg = pkg;
         // Material 3 Expressive shapes (MaterialShapes): Cookie 9, Cookie 12, Clover 4-leaf, Clover 8-leaf, Sunny,
         // Soft burst, Cookie 6, Cookie 7, Cookie 4.
         int[] lobes = {9, 12, 4, 8, 14, 10, 6, 7, 4};
         float[] depths = {0.08f, 0.06f, 0.26f, 0.16f, 0.05f, 0.11f, 0.12f, 0.10f, 0.16f};
         float[] sharp = {1f, 1f, 0.55f, 0.65f, 1f, 2.4f, 1f, 1f, 1f};
-        int k = Math.abs(pkg.hashCode()) % lobes.length;
+        int k = Math.floorMod(pkg.hashCode(), lobes.length);
+        if (shapeAnimator != null) shapeAnimator.cancel();
         cookie.morphTo(lobes[k], depths[k], sharp[k]);
         ValueAnimator a = ValueAnimator.ofFloat(0f, 1f).setDuration(Motion.DEFAULT_SPATIAL_MS);
         a.setInterpolator(Motion.DEFAULT_SPATIAL);
         a.addUpdateListener(an -> cookie.setProgress((float) an.getAnimatedValue()));
-        a.start();
+        shapeAnimator = a;
+        startTransient(a);
     }
 
     /** Cross-fade every tinted surface from the current palette to the next. */
@@ -990,13 +1649,17 @@ public class HomeActivity extends Activity {
             float t = (float) a.getAnimatedValue();
             int top = (int) argb.evaluate(t, from.surfaceBright, next.surfaceBright);
             int bottom = (int) argb.evaluate(t, from.surface, next.surface);
-            backdrop.setColors(new int[]{top, bottom});
+            gradientColors[0] = top;
+            gradientColors[1] = bottom;
+            backdrop.setColors(gradientColors);
             cookie.setColor((int) argb.evaluate(t, from.primaryContainer, next.primaryContainer));
             dockShape.setColor(withAlpha((int) argb.evaluate(t, from.container, next.container), 0xB3));
         });
         colorAnimator.start();
         nav.setPalette(next);
-        styleNowPlaying();
+        styleWeather();
+        styleAppsEditButton();
+        styleAppsGrid();
     }
 
     private Intent launchIntent(String pkg) {
@@ -1004,7 +1667,209 @@ public class HomeActivity extends Activity {
         return intent != null ? intent : pm.getLaunchIntentForPackage(pkg);
     }
 
+    private void showSettingsPanel() {
+        finishAppsEdit(true);
+        if (settingsDialog != null && settingsDialog.isShowing()) return;
+
+        Dialog dialog = new Dialog(this);
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setPadding(dp(22), dp(42), dp(22), dp(22));
+        GradientDrawable surface = new GradientDrawable();
+        surface.setColor(palette.container);
+        float corner = dp(Focus.CARD);
+        surface.setCornerRadii(new float[]{corner, corner, 0, 0, 0, 0, corner, corner});
+        panel.setBackground(surface);
+
+        TextView heading = text("Settings", 28, palette.onSurface, 760);
+        panel.addView(heading);
+        TextView detail = text("Fire TV quick access", 14, palette.onSurfaceVariant, 500);
+        LinearLayout.LayoutParams detailLp = new LinearLayout.LayoutParams(-1, -2);
+        detailLp.topMargin = dp(4);
+        detailLp.bottomMargin = dp(28);
+        panel.addView(detail, detailLp);
+
+        View wifi = settingsPanelRow("Wi-Fi", connectedWifiName(), this::openNetworkSettings);
+        settingsWifiRow = wifi;
+        panel.addView(wifi, new LinearLayout.LayoutParams(-1, dp(88)));
+        View bluetooth = settingsPanelRow("Bluetooth", connectedBluetoothName(), this::openBluetoothSettings);
+        LinearLayout.LayoutParams bluetoothLp = new LinearLayout.LayoutParams(-1, dp(88));
+        bluetoothLp.topMargin = dp(12);
+        panel.addView(bluetooth, bluetoothLp);
+        View all = settingsPanelRow("All Settings", "Amazon Fire TV settings", this::openSystemSettings);
+        LinearLayout.LayoutParams allLp = new LinearLayout.LayoutParams(-1, dp(88));
+        allLp.topMargin = dp(12);
+        panel.addView(all, allLp);
+
+        dialog.setContentView(panel);
+        Window window = dialog.getWindow();
+        if (window != null) {
+            window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+            window.setGravity(Gravity.END | Gravity.TOP);
+            window.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+            window.setDimAmount(0.48f);
+            window.setWindowAnimations(R.style.SettingsPanelMotion);
+        }
+        dialog.setOnDismissListener(ignored -> {
+            if (settingsDialog == dialog) {
+                settingsDialog = null;
+                settingsWifiRow = null;
+            }
+            if (foreground && nav != null && nav.isShown()) nav.button(2).requestFocus();
+        });
+        settingsDialog = dialog;
+        dialog.show();
+        if (window != null) window.setLayout(dp(360), ViewGroup.LayoutParams.MATCH_PARENT);
+        wifi.requestFocus();
+        requestWifiNamePermissionIfNeeded();
+    }
+
+    private void requestWifiNamePermissionIfNeeded() {
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+                || getPreferences(MODE_PRIVATE).getBoolean("wifi_name_permission_requested", false)) return;
+        WifiManager wifi = getSystemService(WifiManager.class);
+        if (wifi == null || !wifi.isWifiEnabled()) return;
+        getPreferences(MODE_PRIVATE).edit().putBoolean("wifi_name_permission_requested", true).apply();
+        requestingWifiNamePermission = true;
+        requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION}, WIFI_NAME_PERMISSION_REQUEST);
+    }
+
+    private void refreshSettingsWifiName() {
+        if (settingsDialog == null || !settingsDialog.isShowing() || settingsWifiRow == null) return;
+        String subtitle = connectedWifiName();
+        ((TextView) ((LinearLayout) settingsWifiRow).getChildAt(1)).setText(subtitle);
+        settingsWifiRow.setContentDescription("Wi-Fi. " + subtitle);
+    }
+
+    private View settingsPanelRow(String title, String subtitle, Runnable action) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.VERTICAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(18), 0, dp(18), 0);
+        row.setFocusable(true);
+        row.setClickable(true);
+        row.setContentDescription(title + ". " + subtitle);
+        GradientDrawable shape = new GradientDrawable();
+        shape.setCornerRadius(dp(24));
+        row.setBackground(shape);
+        TextView name = text(title, 19, palette.onSurface, 650);
+        TextView status = text(subtitle, 14, palette.onSurfaceVariant, 500);
+        status.setSingleLine(true);
+        status.setEllipsize(TextUtils.TruncateAt.END);
+        row.addView(name);
+        LinearLayout.LayoutParams statusLp = new LinearLayout.LayoutParams(-1, -2);
+        statusLp.topMargin = dp(3);
+        row.addView(status, statusLp);
+        row.setOnFocusChangeListener((v, focused) -> {
+            shape.setColor(focused ? palette.inverseSurface : palette.containerHigh);
+            name.setTextColor(focused ? palette.inverseOnSurface : palette.onSurface);
+            status.setTextColor(focused ? palette.inverseOnSurface : palette.onSurfaceVariant);
+        });
+        shape.setColor(palette.containerHigh);
+        row.setOnClickListener(v -> action.run());
+        return row;
+    }
+
+    private String connectedWifiName() {
+        try {
+            WifiManager wifi = getSystemService(WifiManager.class);
+            if (wifi == null || !wifi.isWifiEnabled()) return "Wi-Fi off";
+            WifiInfo info = wifi.getConnectionInfo();
+            if (info != null) {
+                String ssid = info.getSSID();
+                if (!TextUtils.isEmpty(ssid) && !WifiManager.UNKNOWN_SSID.equals(ssid))
+                    return ssid.length() > 1 && ssid.startsWith("\"") && ssid.endsWith("\"")
+                            ? ssid.substring(1, ssid.length() - 1) : ssid;
+            }
+            // Some Fire OS builds expose a connection label here when WifiInfo redacts the SSID.
+            ConnectivityManager connectivity = getSystemService(ConnectivityManager.class);
+            NetworkInfo active = connectivity != null ? connectivity.getActiveNetworkInfo() : null;
+            if (active != null && active.isConnected() && active.getType() == ConnectivityManager.TYPE_WIFI) {
+                String label = active.getExtraInfo();
+                if (!TextUtils.isEmpty(label) && !WifiManager.UNKNOWN_SSID.equals(label))
+                    return label.length() > 1 && label.startsWith("\"") && label.endsWith("\"")
+                            ? label.substring(1, label.length() - 1) : label;
+                return "Connected network name unavailable";
+            }
+            return "Not connected";
+        } catch (SecurityException unavailable) {
+            Log.w("MaterialHome", "Wi-Fi connection name is unavailable", unavailable);
+            return "Network name unavailable";
+        }
+    }
+
+    private String connectedBluetoothName() {
+        try {
+            AudioManager audio = getSystemService(AudioManager.class);
+            if (audio != null) for (AudioDeviceInfo device : audio.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+                int type = device.getType();
+                if (type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP || type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
+                    CharSequence name = device.getProductName();
+                    return TextUtils.isEmpty(name) ? "Bluetooth audio connected" : name.toString();
+                }
+            }
+        } catch (SecurityException unavailable) {
+            Log.w("MaterialHome", "Bluetooth audio name is unavailable", unavailable);
+        }
+        // A Fire TV remote is an active input device, even when audio is routed over HDMI.
+        for (int id : InputDevice.getDeviceIds()) {
+            InputDevice device = InputDevice.getDevice(id);
+            if (device == null || !device.supportsSource(InputDevice.SOURCE_DPAD)) continue;
+            String name = device.getName();
+            if (!TextUtils.isEmpty(name) && name.toLowerCase(Locale.ROOT).contains("remote"))
+                return name;
+        }
+        return "No connected device name available";
+    }
+
+    private void openNetworkSettings() {
+        dismissSettingsPanel();
+        if (launchSettingsDestination("Network", new Intent(Settings.ACTION_WIFI_SETTINGS),
+                new Intent().setComponent(new ComponentName("com.amazon.tv.settings.v2",
+                        "com.amazon.tv.settings.v2.tv.network.NetworkActivity")))) return;
+        openSystemSettings();
+    }
+
+    private void openBluetoothSettings() {
+        dismissSettingsPanel();
+        if (launchSettingsDestination("Other Bluetooth Devices",
+                new Intent("android.settings.CONTROLLERS_SETTINGS"),
+                new Intent().setComponent(new ComponentName("com.amazon.tv.settings.v2",
+                        "com.amazon.tv.settings.v2.tv.controllers_bluetooth_devices.ControllersAndBluetoothActivity")))) return;
+        openSystemSettings();
+    }
+
+    private void dismissSettingsPanel() {
+        if (settingsDialog != null) settingsDialog.dismiss();
+    }
+
+    /** Fire TV exposes its real Settings UI through LEANBACK_SETTINGS, unlike its generic CTS handler. */
+    private void openSystemSettings() {
+        dismissSettingsPanel();
+        finishAppsEdit(false);
+        launchSettingsDestination("All Settings",
+                // Advertised by Fire TV's exported Settings activity; no public SDK 30 constant.
+                new Intent(Intent.ACTION_MAIN).addCategory("android.intent.category.LEANBACK_SETTINGS"),
+                new Intent(Settings.ACTION_SETTINGS));
+    }
+
+    private boolean launchSettingsDestination(String label, Intent... destinations) {
+        for (Intent destination : destinations) {
+            try {
+                startActivity(destination.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                Log.i("MaterialHome", "Launched " + label + ": " + destination);
+                return true;
+            } catch (ActivityNotFoundException | SecurityException unavailable) {
+                Log.w("MaterialHome", "Cannot launch " + label + ": " + destination, unavailable);
+            }
+        }
+        Log.e("MaterialHome", "No " + label + " destination could be launched.");
+        return false;
+    }
+
     private void launch(Intent intent) {
+        if (intent == null) return;
         try {
             startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
         } catch (ActivityNotFoundException | SecurityException ignored) {
@@ -1013,27 +1878,585 @@ public class HomeActivity extends Activity {
 
     // ---- pages ----
 
+    private void toggleAppsEdit() {
+        if (appsEditMode) {
+            finishAppsEdit(true);
+        } else {
+            appsHiddenDraft = new LinkedHashSet<>(choices.hidden());
+            appsEditMode = true;
+            appsKey = null;
+            fillApps();
+            styleAppsEditButton();
+        }
+    }
+
+    /** App visibility is committed whenever its inline editor closes or Apps loses the screen. */
+    private void finishAppsEdit(boolean rebuild) {
+        if (!appsEditMode) return;
+        if (!appsHiddenDraft.equals(choices.hidden())) choices.save(choices.home(), appsHiddenDraft);
+        appsEditMode = false;
+        appsHiddenDraft = null;
+        appsKey = null;
+        if (rebuild) fillApps();
+        styleAppsEditButton();
+    }
+
+    private void styleAppsEditButton() {
+        if (appsEditButton == null) return;
+        if (appsEditShape == null) {
+            appsEditShape = new GradientDrawable();
+            appsEditShape.setCornerRadius(dp(19));
+            appsEditButton.setBackground(appsEditShape);
+        }
+        boolean focused = appsEditButton.hasFocus();
+        appsEditShape.setColor(focused ? palette.inverseSurface :
+                appsEditMode ? palette.primary : palette.containerHigh);
+        appsEditButton.setImageTintList(ColorStateList.valueOf(focused ? palette.inverseOnSurface :
+                appsEditMode ? palette.onPrimary : palette.onSurface));
+        appsEditButton.setContentDescription(appsEditMode ? "Save app visibility" : "Edit app visibility");
+        if (appsTitle != null) appsTitle.setTextColor(palette.onSurface);
+    }
+
+    private void styleAppsGrid() {
+        if (appsGrid == null) return;
+        for (int i = 0; i < appsGrid.getChildCount(); i++) {
+            LinearLayout holder = (LinearLayout) appsGrid.getChildAt(i);
+            ((TextView) holder.getChildAt(1)).setTextColor(palette.onSurfaceVariant);
+            if (appsEditMode) {
+                FrameLayout card = (FrameLayout) tileCard(holder);
+                ImageView badge = (ImageView) card.getChildAt(1);
+                badge.setImageTintList(ColorStateList.valueOf(palette.inverseOnSurface));
+                ((GradientDrawable) badge.getBackground()).setColor(palette.inverseSurface);
+            }
+        }
+    }
+
     private void showHome() {
+        if (homeDockState != HomeDockState.NORMAL) clearHomeDockInteraction(false);
+        finishAppsEdit(false);
+        if (preferencesPage.getVisibility() == View.VISIBLE && dirtyDraft()) {
+            confirmLeave(() -> showHome());
+            return;
+        }
+        preferencesPage.setVisibility(View.GONE);
+        movingSlot = -1;
         showingApps = false;
         appsPage.setVisibility(View.GONE);
         homePage.setVisibility(View.VISIBLE);
         nav.select(0);
-        if (nowCard != null) showNowPlaying();
+        weatherView.setVisibility(View.VISIBLE);
         if (dock.getChildCount() > 0) dock.getChildAt(0).requestFocus();
     }
 
     private void showApps() {
+        if (homeDockState != HomeDockState.NORMAL) clearHomeDockInteraction(false);
+        finishAppsEdit(false);
+        if (preferencesPage.getVisibility() == View.VISIBLE && dirtyDraft()) {
+            confirmLeave(() -> showApps());
+            return;
+        }
+        preferencesPage.setVisibility(View.GONE);
+        movingSlot = -1;
         showingApps = true;
         fillApps();
         homePage.setVisibility(View.GONE);
         appsPage.setVisibility(View.VISIBLE);
         appsPage.scrollTo(0, 0);
         nav.select(1);
-        if (nowCard != null) nowCard.setVisibility(View.GONE);
+        weatherView.setVisibility(View.GONE);
         if (appsGrid.getChildCount() > 0) appsGrid.getChildAt(0).requestFocus();
     }
 
-    // ---- Now Playing ----
+    private void showPreferences() {
+        if (homeDockState != HomeDockState.NORMAL) clearHomeDockInteraction(false);
+        finishAppsEdit(false);
+        if (preferencesPage.getVisibility() != View.VISIBLE) {
+            draftHome = new ArrayList<>(choices.home());
+            draftHidden = new LinkedHashSet<>(choices.hidden());
+            while (draftHome.size() < DOCK_SIZE) draftHome.add("");
+            buildPreferences();
+        }
+        showingApps = false;
+        homePage.setVisibility(View.GONE);
+        appsPage.setVisibility(View.GONE);
+        preferencesPage.setVisibility(View.VISIBLE);
+        preferencesPage.scrollTo(0, 0);
+        nav.select(2);
+        weatherView.setVisibility(View.GONE);
+        if (homeSlots.getChildCount() > 0) tileCard(homeSlots.getChildAt(0)).requestFocus();
+    }
+
+    private boolean dirtyDraft() {
+        return draftHome != null && (!draftHome.equals(choices.home()) || !draftHidden.equals(choices.hidden()));
+    }
+
+    private void savePreferences() {
+        choices.save(draftHome, draftHidden);
+        dockKey = null;
+        appsKey = null;
+        fillDock();
+        fillApps();
+        showHome();
+    }
+
+    private void confirmLeave(Runnable destination) {
+        new AlertDialog.Builder(this).setTitle("Unsaved preferences")
+                .setMessage("Save your changes before leaving Preferences?")
+                .setPositiveButton("Save", (d, which) -> { savePreferences(); destination.run(); })
+                .setNegativeButton("Discard", (d, which) -> {
+                    draftHome = new ArrayList<>(choices.home());
+                    draftHidden = new LinkedHashSet<>(choices.hidden());
+                    destination.run();
+                })
+                .setNeutralButton("Continue Editing", (d, which) -> homeSlots.getChildAt(0).requestFocus())
+                .show();
+    }
+
+    private void leavePreferences() {
+        if (dirtyDraft()) confirmLeave(this::showHome);
+        else showHome();
+    }
+
+    private TextView preferenceButton(String title, Runnable action) {
+        TextView button = text(title, 17, palette.onSurface, 600);
+        button.setGravity(Gravity.CENTER_VERTICAL);
+        button.setPadding(dp(18), 0, dp(18), 0);
+        button.setFocusable(true);
+        button.setClickable(true);
+        GradientDrawable shape = new GradientDrawable();
+        shape.setCornerRadius(dp(24));
+        button.setBackground(shape);
+        button.setOnFocusChangeListener((v, focused) -> {
+            shape.setColor(focused ? palette.inverseSurface : palette.containerHigh);
+            button.setTextColor(focused ? palette.inverseOnSurface : palette.onSurface);
+        });
+        shape.setColor(palette.containerHigh);
+        button.setOnClickListener(v -> action.run());
+        return button;
+    }
+
+    private void preferenceHeading(String title, String detail) {
+        TextView heading = text(title, 27, palette.onSurface, 760);
+        LinearLayout.LayoutParams hp = new LinearLayout.LayoutParams(-1, -2);
+        hp.topMargin = dp(18);
+        preferencesColumn.addView(heading, hp);
+        TextView caption = text(detail, 15, palette.onSurfaceVariant, 500);
+        preferencesColumn.addView(caption);
+    }
+
+    private void buildPreferences() {
+        preferenceApps = installedApps();
+        Collator collator = Collator.getInstance();
+        collator.setStrength(Collator.PRIMARY);
+        Map<String, String> labels = new HashMap<>();
+        for (ResolveInfo info : preferenceApps)
+            labels.put(info.activityInfo.packageName, String.valueOf(info.loadLabel(pm)));
+        preferenceApps.sort((a, b) -> {
+            int order = collator.compare(labels.get(a.activityInfo.packageName), labels.get(b.activityInfo.packageName));
+            return order != 0 ? order : a.activityInfo.packageName.compareTo(b.activityInfo.packageName);
+        });
+        preferencesColumn.removeAllViews();
+        preferenceHeading("Home Apps", "Select to rearrange · Hold Select to replace");
+        homeMoveHint = (TextView) preferencesColumn.getChildAt(1);
+        homeSlots = new LinearLayout(this);
+        homeSlots.setOrientation(LinearLayout.HORIZONTAL);
+        homeSlots.setClipChildren(false);
+        homeSlots.setClipToPadding(false);
+        homeSlots.setPadding(dp(8), dp(8), dp(8), dp(8));
+        LinearLayout.LayoutParams homeLp = new LinearLayout.LayoutParams(-1, -2);
+        homeLp.topMargin = dp(18);
+        preferencesColumn.addView(homeSlots, homeLp);
+        rebuildSlots(-1);
+        preferenceHeading("App Visibility", "Select an app to show or hide it in Apps.");
+        visibilityRows = new GridLayout(this);
+        visibilityRows.setColumnCount(6);
+        visibilityRows.setClipChildren(false);
+        visibilityRows.setClipToPadding(false);
+        LinearLayout.LayoutParams gridLp = new LinearLayout.LayoutParams(-1, -2);
+        gridLp.topMargin = dp(14);
+        preferencesColumn.addView(visibilityRows, gridLp);
+        rebuildVisibility(-1);
+        LinearLayout footer = new LinearLayout(this);
+        LinearLayout.LayoutParams footerLp = new LinearLayout.LayoutParams(-1, dp(48));
+        footerLp.topMargin = dp(20);
+        TextView save = preferenceButton("Save", this::savePreferences);
+        TextView cancel = preferenceButton("Cancel", () -> {
+            draftHome = new ArrayList<>(choices.home());
+            draftHidden = new LinkedHashSet<>(choices.hidden());
+            showHome();
+        });
+        footer.addView(save, new LinearLayout.LayoutParams(dp(135), dp(48)));
+        LinearLayout.LayoutParams cancelLp = new LinearLayout.LayoutParams(dp(135), dp(48));
+        cancelLp.leftMargin = dp(8);
+        footer.addView(cancel, cancelLp);
+        preferencesColumn.addView(footer, footerLp);
+    }
+
+    private String preferenceLabel(String pkg) {
+        if (TextUtils.isEmpty(pkg)) return "Empty — choose an app";
+        if (launchIntent(pkg) == null) return "Unavailable (" + pkg + ") — choose a replacement";
+        try { return String.valueOf(pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0))); }
+        catch (PackageManager.NameNotFoundException e) { return "Unavailable (" + pkg + ") — choose a replacement"; }
+    }
+
+    private int preferenceTileDp() {
+        float screenDp = getResources().getDisplayMetrics().widthPixels / getResources().getDisplayMetrics().density;
+        float inner = screenDp - 2 * (SIDE + DOCK_PAD + SCROLL_PAD) - 5 * GAP - 6 * 2 * RING;
+        return (int) Math.max(96, Math.min(220, inner / 6));
+    }
+
+    private View tileCard(View holder) {
+        return ((FrameLayout) ((LinearLayout) holder).getChildAt(0)).getChildAt(0);
+    }
+
+    private void persistHome() {
+        choices.save(draftHome, choices.hidden());
+        dockKey = null;
+        fillDock();
+    }
+
+    private void rebuildSlots(int focusIndex) {
+        for (Runnable task : longPressTasks.values()) handler.removeCallbacks(task);
+        longPressTasks.clear();
+        homeSlots.removeAllViews();
+        int width = preferenceTileDp();
+        for (int i = 0; i < DOCK_SIZE; i++) {
+            final int index = i;
+            String pkg = draftHome.get(i);
+            View holder = tile(pkg, launchIntent(pkg), width, false, v -> {});
+            View card = tileCard(holder);
+            card.setContentDescription(preferenceLabel(pkg) + ", Home position " + (i + 1)
+                    + (movingSlot == i ? ", moving" : "") + ". Select to move; hold Select to replace.");
+            if (movingSlot == i) card.setBackgroundTintList(ColorStateList.valueOf(palette.primaryContainer));
+            final boolean[] pressed = {false};
+            final boolean[] longOpened = {false};
+            final Runnable[] timeout = new Runnable[1];
+            timeout[0] = () -> {
+                longPressTasks.remove(card);
+                if (pressed[0] && card.hasFocus() && movingSlot < 0) {
+                    longOpened[0] = true;
+                    showReplaceMenu(card, index);
+                }
+            };
+            card.setOnKeyListener((v, key, event) -> {
+                if (movingSlot >= 0) {
+                    if (event.getAction() == KeyEvent.ACTION_DOWN &&
+                            (key == KeyEvent.KEYCODE_DPAD_LEFT || key == KeyEvent.KEYCODE_DPAD_RIGHT)) {
+                        int other = movingSlot + (key == KeyEvent.KEYCODE_DPAD_LEFT ? -1 : 1);
+                        if (other >= 0 && other < DOCK_SIZE) {
+                            Collections.swap(draftHome, movingSlot, other);
+                            movingSlot = other;
+                            rebuildSlots(other);
+                        }
+                        return true;
+                    }
+                    if (key == KeyEvent.KEYCODE_DPAD_UP || key == KeyEvent.KEYCODE_DPAD_DOWN) return true;
+                }
+                if (key != KeyEvent.KEYCODE_DPAD_CENTER && key != KeyEvent.KEYCODE_ENTER) return false;
+                if (event.getAction() == KeyEvent.ACTION_DOWN) {
+                    if (!pressed[0]) {
+                        pressed[0] = true;
+                        longOpened[0] = false;
+                        if (movingSlot < 0) {
+                            longPressTasks.put(card, timeout[0]);
+                            handler.postDelayed(timeout[0], android.view.ViewConfiguration.getLongPressTimeout());
+                        }
+                    }
+                    if (movingSlot < 0 && !longOpened[0]
+                            && (event.isLongPress() || event.getRepeatCount() > 0)) {
+                        handler.removeCallbacks(timeout[0]);
+                        longPressTasks.remove(card);
+                        longOpened[0] = true;
+                        showReplaceMenu(card, index);
+                    }
+                    return true;
+                }
+                if (event.getAction() == KeyEvent.ACTION_UP) {
+                    pressed[0] = false;
+                    handler.removeCallbacks(timeout[0]);
+                    longPressTasks.remove(card);
+                    if (!longOpened[0] && card.hasFocus()) {
+                        if (movingSlot >= 0) finishMove(); else startMove(index);
+                    }
+                    return true;
+                }
+                return true;
+            });
+            card.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+                @Override public void onViewAttachedToWindow(View v) { }
+                @Override public void onViewDetachedFromWindow(View v) {
+                    handler.removeCallbacks(timeout[0]);
+                    longPressTasks.remove(card);
+                }
+            });
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(width + 2 * RING), -2);
+            if (i > 0) lp.leftMargin = dp(GAP);
+            homeSlots.addView(holder, lp);
+        }
+        if (focusIndex >= 0) tileCard(homeSlots.getChildAt(focusIndex)).requestFocus();
+    }
+
+    private void startMove(int index) {
+        moveOriginal = new ArrayList<>(draftHome);
+        movingSlot = index;
+        homeMoveHint.setText("Moving app · Left / Right to position · Select to confirm · Back to cancel");
+        rebuildSlots(index);
+    }
+
+    private void showReplaceMenu(View anchor, int index) {
+        TextView replace = preferenceButton("Replace", () -> {
+            if (preferencesPopup != null) preferencesPopup.dismiss();
+            showReplacementPicker(index, anchor);
+        });
+        replace.setGravity(Gravity.CENTER);
+        PopupWindow popup = new PopupWindow(replace, dp(168), dp(52), true);
+        popup.setBackgroundDrawable(new GradientDrawable());
+        popup.setOutsideTouchable(true);
+        popup.setElevation(dp(12));
+        popup.setAnimationStyle(android.R.style.Animation_Dialog);
+        popup.setOnDismissListener(() -> {
+            if (preferencesPopup == popup) preferencesPopup = null;
+            if (anchor.isAttachedToWindow() && preferencesPage.isShown()) anchor.requestFocus();
+        });
+        preferencesPopup = popup;
+        popup.showAsDropDown(anchor, 0, -dp(118));
+        replace.requestFocus();
+    }
+
+    private void showReplacementPicker(int slot, View origin) {
+        List<ResolveInfo> candidates = new ArrayList<>();
+        for (ResolveInfo info : preferenceApps) {
+            String pkg = info.activityInfo.packageName;
+            if (!draftHidden.contains(pkg) && (!draftHome.contains(pkg) || pkg.equals(draftHome.get(slot))))
+                candidates.add(info);
+        }
+        if (candidates.isEmpty()) {
+            android.widget.Toast.makeText(this, "No visible apps available to replace this slot", android.widget.Toast.LENGTH_LONG).show();
+            origin.requestFocus();
+            return;
+        }
+        GridLayout grid = new GridLayout(this);
+        grid.setColumnCount(5);
+        grid.setClipChildren(false);
+        int tileDp = 142;
+        for (ResolveInfo info : candidates) {
+            String pkg = info.activityInfo.packageName;
+            View holder = tile(pkg, launchIntent(pkg), tileDp, false, v -> {
+                draftHome.set(slot, pkg);
+                if (preferencesPopup != null) preferencesPopup.dismiss();
+                persistHome();
+                rebuildSlots(slot);
+            });
+            GridLayout.LayoutParams lp = new GridLayout.LayoutParams();
+            lp.setMargins(dp(5), dp(6), dp(5), dp(6));
+            grid.addView(holder, lp);
+        }
+        ScrollView scroll = new ScrollView(this);
+        scroll.setClipChildren(false);
+        scroll.setPadding(dp(12), dp(12), dp(12), dp(12));
+        scroll.addView(grid);
+        GradientDrawable surface = new GradientDrawable();
+        surface.setColor(palette.container);
+        surface.setCornerRadius(dp(32));
+        scroll.setBackground(surface);
+        int rows = (candidates.size() + 4) / 5;
+        int pickerHeight = Math.min(430, Math.max(160, rows * (tileDp * 9 / 16 + 2 * RING + 12) + 24));
+        PopupWindow picker = new PopupWindow(scroll, dp(850), dp(pickerHeight), true);
+        picker.setBackgroundDrawable(new GradientDrawable());
+        picker.setOutsideTouchable(true);
+        picker.setElevation(dp(16));
+        picker.setAnimationStyle(android.R.style.Animation_Dialog);
+        picker.setOnDismissListener(() -> {
+            if (preferencesPopup == picker) preferencesPopup = null;
+            if (origin.isAttachedToWindow() && preferencesPage.isShown()) origin.requestFocus();
+        });
+        preferencesPopup = picker;
+        picker.showAtLocation(preferencesPage, Gravity.CENTER, 0, 0);
+        tileCard(grid.getChildAt(0)).requestFocus();
+    }
+
+    private void finishMove() {
+        int index = movingSlot;
+        movingSlot = -1;
+        moveOriginal = null;
+        homeMoveHint.setText("Select to rearrange · Hold Select to replace");
+        persistHome();
+        rebuildSlots(index);
+    }
+    private void cancelMove() {
+        int index = movingSlot;
+        draftHome = moveOriginal;
+        movingSlot = -1;
+        moveOriginal = null;
+        homeMoveHint.setText("Select to rearrange · Hold Select to replace");
+        rebuildSlots(index);
+    }
+
+    private void setHiddenArtwork(View holder, boolean hidden, String pkg) {
+        View card = tileCard(holder);
+        ImageView image = (ImageView) ((FrameLayout) card).getChildAt(0);
+        image.setAlpha(hidden ? 0.44f : 1f);
+        if (hidden) {
+            android.graphics.ColorMatrix matrix = new android.graphics.ColorMatrix();
+            matrix.setSaturation(0f);
+            image.setColorFilter(new android.graphics.ColorMatrixColorFilter(matrix));
+        } else image.clearColorFilter();
+        card.setContentDescription(preferenceLabel(pkg) + ", " + (hidden ? "Hidden" : "Visible") + " in Apps. Select to toggle.");
+    }
+
+    private void rebuildVisibility(int focusIndex) {
+        visibilityRows.removeAllViews();
+        int width = preferenceTileDp();
+        for (int i = 0; i < preferenceApps.size(); i++) {
+            final int index = i;
+            String pkg = preferenceApps.get(i).activityInfo.packageName;
+            View holder = tile(pkg, launchIntent(pkg), width, false, v -> {
+                if (!draftHidden.add(pkg)) draftHidden.remove(pkg);
+                setHiddenArtwork((View) v.getParent().getParent(), draftHidden.contains(pkg), pkg);
+            });
+            setHiddenArtwork(holder, draftHidden.contains(pkg), pkg);
+            GridLayout.LayoutParams lp = new GridLayout.LayoutParams();
+            lp.setMargins(dp(5), dp(7), dp(5), dp(7));
+            visibilityRows.addView(holder, lp);
+        }
+        if (focusIndex >= 0 && focusIndex < visibilityRows.getChildCount())
+            tileCard(visibilityRows.getChildAt(focusIndex)).requestFocus();
+    }
+
+    // ---- weather in the former Now Playing area ----
+
+    private void checkWeatherRefresh() {
+        if (!foreground) return;
+        handler.removeCallbacks(weatherCheck);
+        boolean started = weatherRepository.refreshIfStale(weather -> {
+            if (!foreground) return;
+            renderWeather(weather);
+            scheduleWeatherRefresh();
+        });
+        if (!started) scheduleWeatherRefresh();
+    }
+
+    private boolean weatherForeground() { return foreground; }
+
+    private void scheduleWeatherRefresh() {
+        handler.removeCallbacks(weatherCheck);
+        if (!foreground) return;
+        long delay = weatherRepository.millisUntilRefresh();
+        if (delay != Long.MAX_VALUE) handler.postDelayed(weatherCheck, Math.max(1000, delay));
+    }
+
+    private View buildWeatherWidget() {
+        LinearLayout widget = new LinearLayout(this);
+        widget.setOrientation(LinearLayout.VERTICAL);
+        widget.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+
+        LinearLayout headline = new LinearLayout(this);
+        headline.setGravity(Gravity.CENTER_VERTICAL);
+        weatherIcon = new WeatherIcon(this);
+        headline.addView(weatherIcon, new LinearLayout.LayoutParams(dp(32), dp(32)));
+        weatherTitle = text("Detecting location…", 19, palette.onSurface, 650);
+        weatherTitle.setSingleLine(true);
+        weatherTitle.setEllipsize(TextUtils.TruncateAt.END);
+        weatherTitle.setMaxWidth(dp(215));
+        LinearLayout.LayoutParams cityParams = new LinearLayout.LayoutParams(-2, -2);
+        cityParams.setMarginStart(dp(12));
+        cityParams.setMarginEnd(dp(10));
+        headline.addView(weatherTitle, cityParams);
+        weatherSeparator = new View(this);
+        LinearLayout.LayoutParams headlineDivider = new LinearLayout.LayoutParams(dp(1), dp(22));
+        headlineDivider.setMarginEnd(dp(12));
+        headline.addView(weatherSeparator, headlineDivider);
+        weatherTemp = text("--°C", 24, palette.onSurface, 700);
+        headline.addView(weatherTemp, new LinearLayout.LayoutParams(-2, -2));
+        widget.addView(headline, new LinearLayout.LayoutParams(-2, -2));
+
+        LinearLayout details = new LinearLayout(this);
+        details.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams detailsParams = new LinearLayout.LayoutParams(-2, dp(28));
+        detailsParams.topMargin = dp(8);
+        weatherFeels = text("Feels like --°C", 14, palette.onSurfaceVariant, 500);
+        weatherFeels.setSingleLine(true);
+        details.addView(weatherFeels);
+        weatherRangeSeparator = new View(this);
+        LinearLayout.LayoutParams detailDivider = new LinearLayout.LayoutParams(dp(1), dp(16));
+        detailDivider.setMarginStart(dp(8));
+        detailDivider.setMarginEnd(dp(8));
+        details.addView(weatherRangeSeparator, detailDivider);
+        weatherRangeText = text("--° - --°", 14, palette.onSurfaceVariant, 500);
+        weatherRangeText.setSingleLine(true);
+        details.addView(weatherRangeText);
+        weatherRainSeparator = new View(this);
+        LinearLayout.LayoutParams rainDivider = new LinearLayout.LayoutParams(dp(1), dp(16));
+        rainDivider.setMarginStart(dp(8));
+        rainDivider.setMarginEnd(dp(8));
+        details.addView(weatherRainSeparator, rainDivider);
+        weatherRainIcon = new WeatherIcon(this);
+        weatherRainIcon.setRainMark();
+        details.addView(weatherRainIcon, new LinearLayout.LayoutParams(dp(20), dp(20)));
+        weatherRainChance = text("--%", 14, palette.onSurfaceVariant, 500);
+        LinearLayout.LayoutParams chanceParams = new LinearLayout.LayoutParams(-2, -2);
+        chanceParams.setMarginStart(dp(5));
+        details.addView(weatherRainChance, chanceParams);
+        widget.addView(details, detailsParams);
+
+        weatherAge = text("Cached weather · may be outdated", 11, palette.onSurfaceVariant, 500);
+        weatherAge.setGravity(Gravity.END);
+        LinearLayout.LayoutParams ageParams = new LinearLayout.LayoutParams(-1, -2);
+        ageParams.setMarginStart(dp(42));
+        ageParams.topMargin = dp(2);
+        widget.addView(weatherAge, ageParams);
+        renderWeather(weatherRepository.cached());
+        return widget;
+    }
+
+    private void renderWeather(WeatherRepository.Weather weather) {
+        if (weatherTitle == null) return;
+        IpLocationProvider.Location place = weatherRepository.location();
+        weatherTitle.setText(place != null ? place.label()
+                : weatherRepository.locationUnavailable() ? "Weather unavailable" : "Detecting location…");
+        if (weather == null) {
+            weatherTemp.setText("--°C");
+            weatherFeels.setText("Feels like --°C");
+            weatherRangeText.setText("--° - --°");
+            weatherRainChance.setText("--%");
+            weatherAge.setText("Weather unavailable");
+            weatherAge.setVisibility(place == null ? View.GONE : View.VISIBLE);
+            weatherIcon.setWeather(-1, 1);
+        } else {
+            weatherTemp.setText(Math.round(weather.tempC) + "°C");
+            weatherFeels.setText("Feels like " + (Double.isFinite(weather.feelsLikeC)
+                    ? Math.round(weather.feelsLikeC) + "°C" : "--°C"));
+            weatherIcon.setWeather(weather.code, weather.isDay);
+            if (weather.hasRange()) {
+                weatherRangeText.setText(Math.round(weather.minC) + "° - " + Math.round(weather.maxC) + "°");
+            } else {
+                weatherRangeText.setText("--° - --°");
+            }
+            weatherRainChance.setText(weather.chanceOfRain < 0 ? "--%" : weather.chanceOfRain + "%");
+            weatherAge.setText("Cached weather · may be outdated");
+            weatherAge.setVisibility(place != null && weather.stale(place) &&
+                    System.currentTimeMillis() - weather.fetchedAt >= 60 * 60 * 1000L ? View.VISIBLE : View.GONE);
+        }
+        styleWeather();
+    }
+
+    private void styleWeather() {
+        if (weatherTitle == null) return;
+        weatherTitle.setTextColor(palette.onSurface);
+        weatherTemp.setTextColor(palette.onSurface);
+        weatherFeels.setTextColor(palette.onSurfaceVariant);
+        weatherRangeText.setTextColor(palette.onSurfaceVariant);
+        weatherRainChance.setTextColor(palette.onSurfaceVariant);
+        weatherAge.setTextColor(palette.onSurfaceVariant);
+        int divider = withAlpha(palette.onSurfaceVariant, 0x70);
+        weatherSeparator.setBackgroundColor(divider);
+        weatherRangeSeparator.setBackgroundColor(divider);
+        weatherRainSeparator.setBackgroundColor(divider);
+        weatherIcon.setColors(palette.primary, palette.onSurfaceVariant);
+        weatherRainIcon.setColors(palette.primary, palette.onSurfaceVariant);
+    }
+
+    // ---- dormant Now Playing implementation, kept for a separate removal change ----
 
     private View buildNowPlaying() {
         LinearLayout card = new LinearLayout(this);
@@ -1111,12 +2534,13 @@ public class HomeActivity extends Activity {
                 sessions = getSystemService(MediaSessionManager.class);
                 mediaListener = new ComponentName(this, MediaListener.class);
             }
+            if (sessions == null) return;
             if (!listening) {
                 sessions.addOnActiveSessionsChangedListener(sessionsChanged, mediaListener);
                 listening = true;
             }
             pickSession();
-        } catch (SecurityException notAllowed) {
+        } catch (SecurityException | UnsupportedOperationException notAllowed) {
             // Notification access not granted: the card simply stays hidden.
             nowCard.setVisibility(View.GONE);
         }
@@ -1181,13 +2605,17 @@ public class HomeActivity extends Activity {
         boolean on = state == android.media.tv.TvInputManager.INPUT_STATE_CONNECTED;
         if (on == (dot.getVisibility() == View.VISIBLE)) return;
         if (on) {
+            ((View) dot.getParent()).setVisibility(View.VISIBLE);
             dot.setScaleX(0f);
             dot.setScaleY(0f);
             dot.setVisibility(View.VISIBLE);
             dot.animate().scaleX(1f).scaleY(1f).setInterpolator(Motion.FAST_SPATIAL).setDuration(Motion.FAST_SPATIAL_MS).start();
         } else {
             dot.animate().scaleX(0f).scaleY(0f).setInterpolator(Motion.FAST_EFFECTS).setDuration(Motion.FAST_EFFECTS_MS)
-                    .withEndAction(() -> dot.setVisibility(View.GONE)).start();
+                    .withEndAction(() -> {
+                        dot.setVisibility(View.GONE);
+                        ((View) dot.getParent()).setVisibility(View.GONE);
+                    }).start();
         }
     }
 
@@ -1199,6 +2627,7 @@ public class HomeActivity extends Activity {
             boolean on = e.getKey().equals(pkg);
             EqualizerBadge b = e.getValue();
             if (on && b.getVisibility() != View.VISIBLE) {
+                ((View) b.getParent()).setVisibility(View.VISIBLE);
                 b.setAlpha(0f);
                 b.setScaleX(0.6f);
                 b.setScaleY(0.6f);
@@ -1206,7 +2635,10 @@ public class HomeActivity extends Activity {
                 b.animate().alpha(1f).scaleX(1f).scaleY(1f).setInterpolator(Motion.FAST_SPATIAL).setDuration(Motion.FAST_SPATIAL_MS).start();
             } else if (!on && b.getVisibility() == View.VISIBLE) {
                 b.animate().alpha(0f).setInterpolator(Motion.FAST_EFFECTS).setDuration(Motion.FAST_EFFECTS_MS)
-                        .withEndAction(() -> b.setVisibility(View.GONE)).start();
+                        .withEndAction(() -> {
+                            b.setVisibility(View.GONE);
+                            ((View) b.getParent()).setVisibility(View.GONE);
+                        }).start();
             }
         }
     }
@@ -1487,7 +2919,8 @@ public class HomeActivity extends Activity {
     private void arrive(View v, int index) {
         v.setAlpha(0f);
         v.setTranslationY(dp(18));
-        v.animate().alpha(1f).translationY(0).setStartDelay(40L * index).setInterpolator(Motion.DEFAULT_SPATIAL).setDuration(Motion.DEFAULT_SPATIAL_MS).start();
+        v.animate().alpha(1f).translationY(0).setStartDelay(40L * index).setInterpolator(Motion.DEFAULT_SPATIAL)
+                .setDuration(Motion.DEFAULT_SPATIAL_MS).withEndAction(() -> v.animate().setStartDelay(0)).start();
     }
 
     // ---- helpers ----
